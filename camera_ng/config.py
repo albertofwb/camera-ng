@@ -74,6 +74,11 @@ CAPTURE_WIDTH = get_config('camera.capture.resolution.width', 640)
 CAPTURE_HEIGHT = get_config('camera.capture.resolution.height', 360)
 CAPTURE_QUALITY = get_config('camera.capture.quality', 2)
 
+# 高质量抓拍配置（shot / smart-shot）
+PHOTO_WIDTH = get_config('camera.capture.photo.resolution.width', None)
+PHOTO_HEIGHT = get_config('camera.capture.photo.resolution.height', None)
+PHOTO_QUALITY = get_config('camera.capture.photo.quality', 1)
+
 # 默认参数
 DEFAULT_NUM_STEPS = get_config('detection.scan.default_steps', 8)
 DEFAULT_TOTAL_ANGLE = get_config('detection.scan.default_angle', 180)

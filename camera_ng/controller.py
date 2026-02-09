@@ -14,6 +14,7 @@ from typing import Optional, TYPE_CHECKING
 
 from .config import (
     CAMERA_RTSP, CAPTURE_SEEK_TIME, CAPTURE_WIDTH, CAPTURE_HEIGHT, CAPTURE_QUALITY,
+    PHOTO_WIDTH, PHOTO_HEIGHT, PHOTO_QUALITY,
     DEVICE_SERIAL, ACCESS_TOKEN, ROTATION_SPEED,
     LEFT_LIMIT_STEP_DURATION, TURN_STABILIZE_TIME,
     CENTER_THRESHOLD, MAX_CENTER_ADJUST,
@@ -73,10 +74,10 @@ class CameraController:
             else:
                 self.stream_active = False
 
-    def capture(self, output_path: str = "/tmp/mooer_view.jpg") -> str:
+    def capture(self, output_path: str = "/tmp/mooer_view.jpg", full_quality: bool = False) -> str:
         """抓取当前画面（兼容旧接口）"""
-        # 优先使用视频流
-        if self.stream_active and self.video_stream:
+        # 普通抓图优先复用视频流；高质量抓拍强制走 RTSP 原图路径
+        if not full_quality and self.stream_active and self.video_stream:
             frame = self.video_stream.get_frame()
             if frame is not None:
                 import cv2
@@ -90,11 +91,26 @@ class CameraController:
             "-i", CAMERA_RTSP,
             "-ss", CAPTURE_SEEK_TIME,
             "-vframes", "1",
-            "-vf", f"scale={CAPTURE_WIDTH}:{CAPTURE_HEIGHT}",
-            "-q:v", str(CAPTURE_QUALITY),
-            output_path,
-            "-y",
         ]
+
+        if full_quality:
+            if PHOTO_WIDTH and PHOTO_HEIGHT:
+                cmd.extend(["-vf", f"scale={PHOTO_WIDTH}:{PHOTO_HEIGHT}"])
+            cmd.extend([
+                "-q:v", str(PHOTO_QUALITY),
+                "-frames:v", "1",
+                output_path,
+            ])
+        else:
+            cmd.extend([
+                "-vf", f"scale={CAPTURE_WIDTH}:{CAPTURE_HEIGHT}",
+                "-q:v", str(CAPTURE_QUALITY),
+                output_path,
+            ])
+
+        cmd.extend([
+            "-y",
+        ])
         result = subprocess.run(cmd, capture_output=True)
         if result.returncode != 0:
             raise RuntimeError(f"截图失败: {result.stderr.decode()}")

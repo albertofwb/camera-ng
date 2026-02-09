@@ -26,6 +26,12 @@ source .venv/bin/activate
 python3 -m camera_ng track -g
 ```
 
+#### 🙋 Smart-Shot（右手抬起抓拍）
+基于 track 实时模式，检测到右手抬起后自动抓拍并发送：
+```bash
+python3 -m camera_ng smart-shot -g
+```
+
 #### 📸 智能居中抓拍
 自动寻找人物，居中对齐，稳定 2 秒后抓拍并发送至手机：
 ```bash

@@ -158,3 +158,104 @@ class VisionAnalyzer:
             return "right side"
         else:
             return "center"
+
+
+class HandRaiseDetector:
+    """右手抬起手势检测器（基于 YOLOv8 Pose）"""
+
+    LEFT_SHOULDER_IDX = 5
+    LEFT_WRIST_IDX = 9
+    RIGHT_SHOULDER_IDX = 6
+    RIGHT_WRIST_IDX = 10
+
+    def __init__(self, model_name: str = "yolov8n-pose"):
+        self.model = None
+        self._lock = threading.Lock()
+        self.device = "cuda"
+
+        if YOLO_AVAILABLE:
+            try:
+                self.model = YOLO(f"{model_name}.pt", verbose=False)
+                self.model.to(self.device)
+                print(f"✅ Pose model loaded ({model_name}) on device: {self.device}")
+            except Exception as e:
+                print(f"⚠️  Pose model load failed: {e}")
+
+    def get_hand_raise_state(
+        self,
+        frame: np.ndarray,
+        conf_threshold: float = 0.2,
+    ) -> tuple[bool, str]:
+        """检测画面主人物是否抬手（右手/左手任一）"""
+        if self.model is None:
+            return False, "pose model unavailable"
+
+        with self._lock:
+            try:
+                results = self.model(frame, verbose=False, device=self.device)
+                if not results:
+                    return False, "no pose result"
+
+                result = results[0]
+                keypoints = getattr(result, "keypoints", None)
+                if keypoints is None or keypoints.xy is None or len(keypoints.xy) == 0:
+                    return False, "no keypoints"
+
+                boxes = result.boxes
+                if boxes is None or boxes.xyxy is None or len(boxes.xyxy) == 0:
+                    return False, "no boxes"
+
+                box_areas = (boxes.xyxy[:, 2] - boxes.xyxy[:, 0]) * (boxes.xyxy[:, 3] - boxes.xyxy[:, 1])
+                person_idx = int(box_areas.argmax().item())
+                person_box = boxes.xyxy[person_idx]
+                box_h = max(float(person_box[3] - person_box[1]), 1.0)
+                margin = max(10.0, box_h * 0.08)
+
+                points = keypoints.xy[person_idx]
+                kpt_conf = keypoints.conf[person_idx] if keypoints.conf is not None else None
+
+                left_shoulder = points[self.LEFT_SHOULDER_IDX]
+                left_wrist = points[self.LEFT_WRIST_IDX]
+                shoulder = points[self.RIGHT_SHOULDER_IDX]
+                wrist = points[self.RIGHT_WRIST_IDX]
+
+                if kpt_conf is not None:
+                    right_valid = (
+                        float(kpt_conf[self.RIGHT_SHOULDER_IDX]) >= conf_threshold
+                        and float(kpt_conf[self.RIGHT_WRIST_IDX]) >= conf_threshold
+                    )
+                    left_valid = (
+                        float(kpt_conf[self.LEFT_SHOULDER_IDX]) >= conf_threshold
+                        and float(kpt_conf[self.LEFT_WRIST_IDX]) >= conf_threshold
+                    )
+                else:
+                    right_valid = True
+                    left_valid = True
+
+                right_raised = False
+                left_raised = False
+
+                if right_valid:
+                    shoulder_y = float(shoulder[1])
+                    wrist_y = float(wrist[1])
+                    right_raised = wrist_y < (shoulder_y - margin)
+
+                if left_valid:
+                    left_shoulder_y = float(left_shoulder[1])
+                    left_wrist_y = float(left_wrist[1])
+                    left_raised = left_wrist_y < (left_shoulder_y - margin)
+
+                if right_raised:
+                    return True, "right hand raised"
+                if left_raised:
+                    return True, "left hand raised"
+
+                return False, "hands below threshold"
+            except Exception as e:
+                print(f"⚠️  HandRaise detection error: {e}")
+                return False, str(e)
+
+    def is_right_hand_raised(self, frame: np.ndarray, conf_threshold: float = 0.2) -> bool:
+        """兼容旧接口：任一手抬起返回 True"""
+        raised, _ = self.get_hand_raise_state(frame, conf_threshold=conf_threshold)
+        return raised

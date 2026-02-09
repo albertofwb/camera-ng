@@ -21,7 +21,7 @@ from camera_ng import (
     TRACKER_MAX_AGE, TRACKER_MIN_HITS,
     CAPTURE_WIDTH, CAPTURE_HEIGHT, LOCK_FILE,
     CAMERA_RTSP, DEVICE_SERIAL, ACCESS_TOKEN,
-    CameraController, VisionAnalyzer,
+    CameraController, VisionAnalyzer, HandRaiseDetector,
     PersonTracker, TrackingMemory
 )
 
@@ -164,6 +164,29 @@ class SingleInstanceLock:
         self.release()
 
 
+def capture_and_send_current_view(camera: CameraController, message: str) -> bool:
+    """基于当前画面直接抓拍并发送，不执行找人流程"""
+    img_path = camera.capture(full_quality=True)
+    print(f"📸 已抓拍当前画面: {img_path}")
+
+    try:
+        target = "1115213761"
+        send_cmd = [
+            "openclaw", "message", "send",
+            "--channel", "telegram",
+            "--target", target,
+            "--media", img_path,
+            "--message", message
+        ]
+        print("📤 正在通过 OpenClaw 发送照片...")
+        subprocess.run(send_cmd, check=True)
+        print("✅ 照片发送成功！")
+        return True
+    except Exception as e:
+        print(f"❌ 照片发送失败: {e}")
+        return False
+
+
 def check_single_instance():
     """检查是否单实例运行"""
     lock = SingleInstanceLock()
@@ -178,7 +201,8 @@ def check_single_instance():
 def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                          total_angle: float = 360,
                          detection_interval: int = DETECTION_INTERVAL,
-                         use_gpu: bool = False) -> None:
+                         use_gpu: bool = False,
+                         smart_shot: bool = False) -> None:
     """实时目标跟踪模式"""
     cam = SmartCamera()
     tracker = PersonTracker(
@@ -195,6 +219,23 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     
     fps_history = deque(maxlen=30)
     last_time = time.time()
+    offset_x_history = deque(maxlen=5)
+    offset_y_history = deque(maxlen=5)
+    recenter_candidate_count = 0
+    last_recenter_time = 0.0
+
+    # 抗抖参数：避免“转头/喝水”这类短时姿态变化触发云台
+    RECENTER_CONFIRM_FRAMES = 3
+    RECENTER_COOLDOWN = 1.2
+    BASE_RECENTER_X_THRESHOLD = 0.5
+    BASE_RECENTER_Y_THRESHOLD = 0.6
+
+    hand_raise_detector = HandRaiseDetector() if smart_shot else None
+    hand_raise_confirm_frames = 2
+    hand_raise_count = 0
+    shot_cooldown = 3.0
+    last_shot_time = 0.0
+    last_hand_log_time = 0.0
 
     print("\n" + "=" * 60)
     print("🔍 启动实时目标跟踪模式 (Real-time + SORT)")
@@ -203,6 +244,10 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     print(f"YOLO检测间隔: 每{detection_interval}帧")
     print(f"跟踪器: SORT (max_age={TRACKER_MAX_AGE}, min_hits={TRACKER_MIN_HITS})")
     print(f"视频解码: {'GPU (CUDA)' if use_gpu else 'CPU'}")
+    if smart_shot:
+        print("📸 Smart-Shot: 右手抬起触发自动抓拍并发送")
+        if hand_raise_detector is None or hand_raise_detector.model is None:
+            print("⚠️ Smart-Shot pose 模型不可用，抬手检测不会触发")
     print("按 Ctrl+C 停止追踪")
     print("=" * 60 + "\n")
 
@@ -285,26 +330,87 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     cy = (main_person.bbox[1] + main_person.bbox[3]) / 2
                     offset_x = (cx - CAPTURE_WIDTH/2) / (CAPTURE_WIDTH/2)
                     offset_y = (cy - CAPTURE_HEIGHT/2) / (CAPTURE_HEIGHT/2)
+
+                    offset_x_history.append(offset_x)
+                    offset_y_history.append(offset_y)
+                    smoothed_offset_x = sum(offset_x_history) / len(offset_x_history)
+                    smoothed_offset_y = sum(offset_y_history) / len(offset_y_history)
                     
                     # 更新运动记忆
                     current_angle = cam.camera.tracking_memory.last_angle
-                    if offset_x < -0.3:
+                    if smoothed_offset_x < -0.3:
                         current_angle = (current_angle - 20) % 360
-                    elif offset_x > 0.3:
+                    elif smoothed_offset_x > 0.3:
                         current_angle = (current_angle + 20) % 360
                     cam.camera.tracking_memory.update(current_angle)
                     
-                    # 触发居中逻辑
-                    if abs(offset_x) > 0.5 or abs(offset_y) > 0.6:
-                        print(f"\n   🎯 发现大幅偏移: 水平{offset_x:+.2f}, 垂直{offset_y:+.2f}")
-                        cam.camera.center_person(offset_x, offset_y)
+                    # 触发居中逻辑（连续多帧 + 平滑 + 冷却）
+                    person_width_ratio = (main_person.bbox[2] - main_person.bbox[0]) / CAPTURE_WIDTH
+                    dynamic_x_threshold = BASE_RECENTER_X_THRESHOLD + min(0.25, person_width_ratio * 0.35)
+                    need_recenter = (
+                        abs(smoothed_offset_x) > dynamic_x_threshold
+                        or abs(smoothed_offset_y) > BASE_RECENTER_Y_THRESHOLD
+                    )
+
+                    if need_recenter:
+                        recenter_candidate_count += 1
+                    else:
+                        recenter_candidate_count = 0
+
+                    if (
+                        recenter_candidate_count >= RECENTER_CONFIRM_FRAMES
+                        and (current_time - last_recenter_time) >= RECENTER_COOLDOWN
+                    ):
+                        print(
+                            f"\n   🎯 持续偏移触发居中: 水平{smoothed_offset_x:+.2f}, 垂直{smoothed_offset_y:+.2f}"
+                        )
+                        cam.camera.center_person(smoothed_offset_x, smoothed_offset_y)
+                        recenter_candidate_count = 0
+                        last_recenter_time = current_time
+                        offset_x_history.clear()
+                        offset_y_history.clear()
                         # 仅在调整云台后短暂停顿，其他时间全力跑
                         time.sleep(0.5)
+
+                    if smart_shot and hand_raise_detector is not None:
+                        hand_raised, hand_reason = hand_raise_detector.get_hand_raise_state(frame)
+                        if hand_raised:
+                            hand_raise_count = min(hand_raise_count + 1, hand_raise_confirm_frames)
+                        else:
+                            hand_raise_count = max(hand_raise_count - 1, 0)
+
+                        if (current_time - last_hand_log_time) >= 2.0:
+                            print(f"\n   🙋 手势检测: {hand_reason} | 连续帧: {hand_raise_count}/{hand_raise_confirm_frames}")
+                            last_hand_log_time = current_time
+
+                        if (
+                            hand_raise_count >= hand_raise_confirm_frames
+                            and (current_time - last_shot_time) >= shot_cooldown
+                        ):
+                            if "left" in hand_reason:
+                                hand_text = "左手"
+                            elif "right" in hand_reason:
+                                hand_text = "右手"
+                            else:
+                                hand_text = "手势"
+
+                            print(f"\n   🙋 检测到{hand_text}抬起，进入 Smart-Shot（不重新找人）...")
+                            capture_and_send_current_view(
+                                cam.camera,
+                                f"Albert，我检测到你抬{hand_text}，已为你抓拍！📸",
+                            )
+
+                            last_shot_time = current_time
+                            hand_raise_count = 0
                     
                     lost_count = 0
                 else:
+                    recenter_candidate_count = 0
+                    offset_x_history.clear()
+                    offset_y_history.clear()
                     lost_count += 1
                     if lost_count >= LOST_THRESHOLD:
+                        hand_raise_count = 0
                         print(f"\n   ⚠️ 丢失目标，重新扫描...")
                         analyzing = False
                         person_found = False
@@ -338,6 +444,7 @@ def show_help():
     print("\n可用命令:")
     print("  human [选项] [步数] [角度]  - 多步扫描找人")
     print("  track [选项] [步数] [角度]  - 实时跟踪模式")
+    print("  smart-shot [选项]           - 跟踪+右手抬起自动抓拍发送")
     print("  shot [步数] [角度]          - 拍照并发送")
     print("  calibrate                   - 校准云台转速")
     print("\n选项:")
@@ -394,24 +501,7 @@ def main():
             result = cam.human(num_steps=num_steps, total_angle=total_angle, 
                              use_gpu=use_gpu, center_and_wait=True)
             if result:
-                img_path = cam.camera.capture()
-                print(f"📸 已自动抓拍并居中: {img_path}")
-                
-                try:
-                    target = "1115213761"
-                    msg = "Albert，我抓拍到你啦！📸💕"
-                    send_cmd = [
-                        "openclaw", "message", "send",
-                        "--channel", "telegram",
-                        "--target", target,
-                        "--media", img_path,
-                        "--message", msg
-                    ]
-                    print(f"📤 正在通过 OpenClaw 发送照片...")
-                    subprocess.run(send_cmd, check=True)
-                    print("✅ 照片发送成功！")
-                except Exception as e:
-                    print(f"❌ 照片发送失败: {e}")
+                capture_and_send_current_view(cam.camera, "Albert，我抓拍到你啦！📸💕")
                     
             print(f"\n{'='*60}")
             print(f"拍照结果: {'成功' if result else '未找到人'}")
@@ -420,12 +510,20 @@ def main():
             
         elif cmd == "track":
             track_human_realtime(num_steps=num_steps, total_angle=total_angle, use_gpu=use_gpu)
+
+        elif cmd == "smart-shot":
+            track_human_realtime(
+                num_steps=num_steps,
+                total_angle=total_angle,
+                use_gpu=use_gpu,
+                smart_shot=True,
+            )
             
         elif cmd == "calibrate":
             subprocess.run(["python3", "/home/albert/clawd/scripts/calibrate_speed.py"])
         else:
             print(f"未知命令: {cmd}")
-            print("支持命令: human, shot, track, calibrate")
+            print("支持命令: human, shot, track, smart-shot, calibrate")
             sys.exit(1)
     finally:
         lock.release()

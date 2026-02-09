@@ -7,6 +7,7 @@ from .config import (
     CONFIG, load_config, get_config,
     CAMERA_RTSP, DEVICE_SERIAL, ACCESS_TOKEN,
     CAPTURE_WIDTH, CAPTURE_HEIGHT,
+    PHOTO_WIDTH, PHOTO_HEIGHT, PHOTO_QUALITY,
     DEFAULT_NUM_STEPS, DEFAULT_TOTAL_ANGLE,
     YOLO_MODEL, YOLO_CONFIDENCE,
     ROTATION_SPEED, TRACK_CHECK_INTERVAL, DETECTION_INTERVAL,
@@ -14,7 +15,7 @@ from .config import (
     LOCK_FILE
 )
 from .stream import VideoStream
-from .vision import YOLOPersonDetector, VisionAnalyzer
+from .vision import YOLOPersonDetector, VisionAnalyzer, HandRaiseDetector
 from .tracking import (
     Detection, Track, SORTTracker,
     PersonTracker, TrackingMemory
@@ -27,6 +28,7 @@ __all__ = [
     "CONFIG", "load_config", "get_config",
     "CAMERA_RTSP", "DEVICE_SERIAL", "ACCESS_TOKEN",
     "CAPTURE_WIDTH", "CAPTURE_HEIGHT",
+    "PHOTO_WIDTH", "PHOTO_HEIGHT", "PHOTO_QUALITY",
     "DEFAULT_NUM_STEPS", "DEFAULT_TOTAL_ANGLE",
     "YOLO_MODEL", "YOLO_CONFIDENCE",
     "ROTATION_SPEED", "TRACK_CHECK_INTERVAL", "DETECTION_INTERVAL",
@@ -35,7 +37,7 @@ __all__ = [
     # Stream
     "VideoStream",
     # Vision
-    "YOLOPersonDetector", "VisionAnalyzer",
+    "YOLOPersonDetector", "VisionAnalyzer", "HandRaiseDetector",
     # Tracking
     "Detection", "Track", "SORTTracker",
     "PersonTracker", "TrackingMemory",

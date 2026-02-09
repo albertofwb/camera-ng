@@ -5,9 +5,12 @@ TTS 模块 - XiaoxiaoTTS
 """
 
 import os
+import queue
 import subprocess
+import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 
 class XiaoxiaoTTS:
@@ -119,3 +122,68 @@ class XiaoxiaoTTS:
         ]
         result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return result.returncode == 0
+
+
+class AsyncVoiceQueue:
+    """异步语音队列：主线程只入队，不阻塞"""
+
+    def __init__(
+        self,
+        tts: Optional[XiaoxiaoTTS],
+        max_queue_size: int = 8,
+        drop_oldest: bool = False,
+    ):
+        self.tts = tts
+        self.drop_oldest = drop_oldest
+        self._queue: queue.Queue[str] = queue.Queue(maxsize=max_queue_size)
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._thread.start()
+
+    def enqueue(self, text: str) -> bool:
+        if not text:
+            return False
+        if self.tts is None or not self.tts.is_available():
+            return False
+
+        if self.drop_oldest and self._queue.full():
+            try:
+                _ = self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                pass
+
+        try:
+            self._queue.put_nowait(text)
+            return True
+        except queue.Full:
+            return False
+
+    def _worker_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                text = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                tts = self.tts
+                if tts is not None and tts.playback(text):
+                    print(f"🔈 已播报: {text}")
+                else:
+                    print(f"⚠️ 本机未播报: {text}")
+            except Exception:
+                print(f"⚠️ 本机播报异常: {text}")
+            finally:
+                self._queue.task_done()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.8)

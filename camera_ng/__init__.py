@@ -21,7 +21,7 @@ from .tracking import (
     PersonTracker, TrackingMemory
 )
 from .controller import CameraController
-from .tts import XiaoxiaoTTS
+from .tts import XiaoxiaoTTS, AsyncVoiceQueue
 from .handlers import (
     HandGestureHandler, HandGesture, GestureEvent,
     RecordingManager, SmartShotWorker,
@@ -49,7 +49,7 @@ __all__ = [
     # Controller
     "CameraController",
     # TTS
-    "XiaoxiaoTTS",
+    "XiaoxiaoTTS", "AsyncVoiceQueue",
     # Handlers
     "HandGestureHandler", "HandGesture", "GestureEvent",
     "RecordingManager", "SmartShotWorker",

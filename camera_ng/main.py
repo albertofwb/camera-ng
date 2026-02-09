@@ -21,7 +21,7 @@ from camera_ng import (
     TRACKER_MAX_AGE, TRACKER_MIN_HITS,
     CAPTURE_WIDTH, CAPTURE_HEIGHT, LOCK_FILE,
     CAMERA_RTSP, DEVICE_SERIAL, ACCESS_TOKEN,
-    CameraController, VisionAnalyzer, HandRaiseDetector, XiaoxiaoTTS,
+    CameraController, VisionAnalyzer, HandRaiseDetector, XiaoxiaoTTS, AsyncVoiceQueue,
     PersonTracker, TrackingMemory
 )
 from camera_ng.handlers import (
@@ -221,11 +221,6 @@ def capture_and_send_current_view(
 def send_greeting_voice(tts: XiaoxiaoTTS, message: str, send_to_tg: bool = False) -> bool:
     """发送中文问候语音（可选 Telegram）"""
     try:
-        if tts.playback(message):
-            print("🔈 已在本机播放问候语音")
-        else:
-            print("⚠️ 本机语音播放失败（已继续发送 Telegram 语音）")
-
         if not send_to_tg:
             print("📭 Telegram 语音发送已关闭（使用 --tg 开启）")
             return True
@@ -296,7 +291,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                          smart_shot: bool = False,
                          quick_mode: bool = False,
                          send_to_tg: bool = False,
-                         enable_miss: bool = False) -> None:
+                         enable_miss: bool = False,
+                         voice_drop_oldest: bool = False) -> None:
     """实时目标跟踪模式 - 使用重构后的处理器"""
     cam = SmartCamera()
     effective_detection_interval = 1 if quick_mode else detection_interval
@@ -319,31 +315,30 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     offset_y_history = deque(maxlen=5)
     recenter_candidate_count = 0
     last_recenter_time = 0.0
-    post_found_settle_until = 0.0
 
     # 云台控制参数
     RECENTER_CONFIRM_FRAMES = 3
     RECENTER_COOLDOWN = 1.2
     BASE_RECENTER_X_THRESHOLD = 0.5
     BASE_RECENTER_Y_THRESHOLD = 0.6
-    POST_FOUND_SETTLE_SEC = 0.3
+    POST_FOUND_REVERSE_STEP_SEC = 0.15
+    POST_FOUND_REVERSE_MIN_OFFSET = 0.08
 
     status_voice_last_ts: dict[str, float] = {}
 
     def broadcast_status(text: str, min_interval_sec: float = 0.0) -> None:
-        if tts is None or not tts.is_available():
-            return
         now = time.time()
         last_ts = status_voice_last_ts.get(text, 0.0)
         if min_interval_sec > 0 and (now - last_ts) < min_interval_sec:
             return
         status_voice_last_ts[text] = now
-        if tts.playback(text):
-            print(f"🔈 已播报: {text}")
+        voice_queue.enqueue(text)
 
     # Smart-Shot 组件
     tts = XiaoxiaoTTS()
-    hand_detector = HandRaiseDetector() if smart_shot else None
+    voice_queue = AsyncVoiceQueue(tts=tts, max_queue_size=8, drop_oldest=voice_drop_oldest)
+    voice_queue.start()
+    hand_detector = HandRaiseDetector(infer_imgsz=224 if quick_mode else 256) if smart_shot else None
     gesture_handler = (
         HandGestureHandler(
             detector=hand_detector,
@@ -351,7 +346,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
             release_frames=2 if quick_mode else 3,
             cooldown_sec=0.6 if quick_mode else 1.0,
             log_interval_sec=0.5 if quick_mode else 1.0,
-            detect_interval_sec=0.12 if quick_mode else 0.25,
+            detect_interval_sec=0.20 if quick_mode else 0.40,
         )
         if smart_shot and hand_detector else None
     )
@@ -359,6 +354,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         RecordingManager(
             rtsp_url=CAMERA_RTSP,
             tts=tts,
+            voice_enqueue=voice_queue.enqueue,
             toggle_cooldown_sec=1.5,
             auto_start_on_person_found=False,
         )
@@ -377,6 +373,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
             camera=cam.camera,
             tts=tts,
             telegram_target=TELEGRAM_TARGET,
+            voice_enqueue=voice_queue.enqueue,
             max_queue_size=3,
             task_callback=smart_shot_task_callback,
         )
@@ -405,9 +402,11 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         if tts is None or not tts.is_available():
             print("⚠️ 晓晓 TTS 不可用，右手抬起后不会发送语音")
         print("📬 Smart-Shot 队列策略: drop_oldest（队列满时丢弃最旧任务）")
-        print(f"🙋 手势检测频率: 每 {0.12 if quick_mode else 0.25:.2f}s 一次（降低跟踪卡顿）")
+        print(f"🙋 手势检测频率: 每 {0.20 if quick_mode else 0.40:.2f}s 一次（优先跟随流畅度）")
+        print(f"🙋 手势模型输入: {224 if quick_mode else 256}px")
         print("🎬 录像策略: 仅左手抬起开始，丢失目标时自动停止")
     print(f"🔔 目标丢失播报: {'开启' if enable_miss else '关闭（使用 --enable-miss 开启）'}")
+    print(f"🔊 语音队列: {'drop_oldest' if voice_drop_oldest else 'keep_all'}")
     if quick_mode:
         print("⚡ Quick 模式: 高频检测 + 更低冷静时间")
     print("按 Ctrl+C 停止追踪")
@@ -464,8 +463,18 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
                     analyzing = True
                     lost_count = 0
-                    post_found_settle_until = time.time() + POST_FOUND_SETTLE_SEC
-                    print(f"⏸️ 找到目标后稳定 {POST_FOUND_SETTLE_SEC:.1f}s，再执行移动")
+
+                    # 找到目标后，按人物偏移做一次反方向微调（替代固定等待）
+                    init_main = tracker.get_main_person()
+                    if init_main is not None:
+                        init_cx = (init_main.bbox[0] + init_main.bbox[2]) / 2
+                        init_offset_x = (init_cx - CAPTURE_WIDTH / 2) / (CAPTURE_WIDTH / 2)
+                        if init_offset_x >= POST_FOUND_REVERSE_MIN_OFFSET:
+                            cam.camera.ptz_turn("left", POST_FOUND_REVERSE_STEP_SEC)
+                            print(f"↩️ 捕获后反向微调: left {POST_FOUND_REVERSE_STEP_SEC:.2f}s")
+                        elif init_offset_x <= -POST_FOUND_REVERSE_MIN_OFFSET:
+                            cam.camera.ptz_turn("right", POST_FOUND_REVERSE_STEP_SEC)
+                            print(f"↪️ 捕获后反向微调: right {POST_FOUND_REVERSE_STEP_SEC:.2f}s")
 
                     # 找到目标：按配置决定是否自动开始录像
                     if recording_mgr:
@@ -519,13 +528,9 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     else:
                         recenter_candidate_count = 0
 
-                    if current_time < post_found_settle_until:
-                        recenter_candidate_count = 0
-
                     if (
                         recenter_candidate_count >= RECENTER_CONFIRM_FRAMES
                         and (current_time - last_recenter_time) >= RECENTER_COOLDOWN
-                        and current_time >= post_found_settle_until
                     ):
                         broadcast_status("校准中", min_interval_sec=0.5)
                         print(f"\n   🎯 持续偏移触发居中: 水平{smoothed_offset_x:+.2f}, 垂直{smoothed_offset_y:+.2f}")
@@ -539,6 +544,12 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
                     # 手势检测
                     if gesture_handler and smart_shot_worker:
+                        # 目标偏移较大时优先云台跟随，暂缓手势推理，避免拖慢跟踪
+                        if abs(smoothed_offset_x) > 0.65 or abs(smoothed_offset_y) > 0.75:
+                            lost_count = 0
+                            time.sleep(frame_sleep)
+                            continue
+
                         x1, y1, x2, y2 = [int(v) for v in main_person.bbox]
                         box_w = max(1, x2 - x1)
                         box_h = max(1, y2 - y1)
@@ -556,13 +567,6 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
                         event = gesture_handler.update(gesture_frame, current_time)
 
-                        # 日志输出
-                        if gesture_handler.should_log(current_time):
-                            hand_raised, reason, count = gesture_handler.get_status()
-                            status_icon = "✓" if hand_raised else "✗"
-                            confirm_frames = gesture_handler.confirm_frames
-                            print(f"\n   🙋 手势: {reason} [当前帧:{status_icon}] | 连续: {count}/{confirm_frames}")
-
                         # 处理触发事件
                         if event:
                             handle_gesture_event(
@@ -578,10 +582,6 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     recenter_candidate_count = 0
                     offset_x_history.clear()
                     offset_y_history.clear()
-
-                    if current_time < post_found_settle_until:
-                        time.sleep(frame_sleep)
-                        continue
 
                     lost_count += 1
 
@@ -618,6 +618,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     except KeyboardInterrupt:
         print("\n\n停止追踪...")
     finally:
+        voice_queue.stop()
         if recording_mgr:
             recording_mgr.cleanup()
         if smart_shot_worker:
@@ -647,6 +648,7 @@ def show_help():
     print("  -quick, --quick             - 高性能模式（更灵敏，更耗电）")
     print("  --tg, --telegram            - 开启 Telegram 发送（默认关闭）")
     print("  --enable-miss              - 开启“目标丢失”语音播报")
+    print("  --voice-drop-oldest         - 语音队列满时丢弃最旧播报")
     print("  --overwrite                 - 仅用于 prepare-tts，覆盖已有音频")
     print("  --speed <度/秒>             - 指定转速")
     print("\n示例:")
@@ -661,6 +663,7 @@ def show_help():
     print("  - 左手抬起：开始/停止录像")
     print("  - 目标捕获/校准中/校准完成：默认播报")
     print("  - 目标丢失：仅 --enable-miss 时播报")
+    print("  - 语音播报统一异步队列；可用 --voice-drop-oldest 避免积压")
     print("  - Telegram 默认关闭；加 --tg 才发送")
 
 
@@ -704,6 +707,11 @@ def main():
     if "--enable-miss" in args:
         enable_miss = True
         args = [a for a in args if a != "--enable-miss"]
+
+    voice_drop_oldest = False
+    if "--voice-drop-oldest" in args:
+        voice_drop_oldest = True
+        args = [a for a in args if a != "--voice-drop-oldest"]
 
     # 解析转速选项
     global ROTATION_SPEED
@@ -757,6 +765,7 @@ def main():
                 quick_mode=quick_mode,
                 send_to_tg=send_to_tg,
                 enable_miss=enable_miss,
+                voice_drop_oldest=voice_drop_oldest,
             )
 
         elif cmd == "smart-shot":
@@ -768,6 +777,7 @@ def main():
                 quick_mode=quick_mode,
                 send_to_tg=send_to_tg,
                 enable_miss=enable_miss,
+                voice_drop_oldest=voice_drop_oldest,
             )
 
         elif cmd == "prepare-tts":

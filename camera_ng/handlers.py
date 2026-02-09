@@ -139,11 +139,13 @@ class RecordingManager:
         self,
         rtsp_url: str,
         tts: Optional[XiaoxiaoTTS] = None,
+        voice_enqueue: Optional[Callable[[str], bool]] = None,
         toggle_cooldown_sec: float = 1.5,
         auto_start_on_person_found: bool = False,
     ):
         self.rtsp_url = rtsp_url
         self.tts = tts
+        self.voice_enqueue = voice_enqueue
         self.toggle_cooldown_sec = toggle_cooldown_sec
         self.auto_start_on_person_found = auto_start_on_person_found
 
@@ -157,7 +159,7 @@ class RecordingManager:
         import os
 
         try:
-            output_dir = os.path.expanduser("~/Desktop/capture")
+            output_dir = os.path.expanduser("~/Desktop/capture/videos")
             os.makedirs(output_dir, exist_ok=True)
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             output_path = os.path.join(output_dir, f"{timestamp}.mp4")
@@ -257,21 +259,9 @@ class RecordingManager:
             self._broadcast("丢失目标，停止录像")
 
     def _broadcast(self, text: str):
-        """语音播报"""
-        tts = self.tts
-        if tts is None or not tts.is_available():
-            return
-
-        def _worker():
-            try:
-                if tts.playback(text):
-                    print(f"🔈 已播报: {text}")
-                else:
-                    print(f"⚠️ 本机未播报: {text}")
-            except Exception:
-                print(f"⚠️ 本机播报异常: {text}")
-
-        threading.Thread(target=_worker, daemon=True).start()
+        """语音播报（异步入队）"""
+        if self.voice_enqueue is not None:
+            self.voice_enqueue(text)
 
     def cleanup(self):
         """清理资源"""
@@ -293,6 +283,7 @@ class SmartShotWorker:
         camera: CameraController,
         tts: Optional[XiaoxiaoTTS],
         telegram_target: str,
+        voice_enqueue: Optional[Callable[[str], bool]] = None,
         max_queue_size: int = 3,
         ack_cooldown_sec: float = 1.2,
         task_callback: Optional[Callable] = None,
@@ -300,6 +291,7 @@ class SmartShotWorker:
         self.camera = camera
         self.tts = tts
         self.telegram_target = telegram_target
+        self.voice_enqueue = voice_enqueue
         self._task_callback = task_callback
         self.ack_cooldown_sec = ack_cooldown_sec
         self._last_ack_time = 0.0
@@ -350,12 +342,10 @@ class SmartShotWorker:
             # 播放收到提示
             now = time.time()
             if (
-                self.tts is not None
-                and self.tts.is_available()
+                self.voice_enqueue is not None
                 and (now - self._last_ack_time) >= self.ack_cooldown_sec
             ):
-                if self.tts.playback("收到"):
-                    print("🔈 已本机播报: 收到")
+                self.voice_enqueue("收到")
                 self._last_ack_time = now
             return True
         except queue.Full:

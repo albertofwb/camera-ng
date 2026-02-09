@@ -309,7 +309,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                         analyzing = False
                         person_found = False
                 
-                # 移除主循环里的 time.sleep(0.01)，让它跑得跟显卡一样快！
+                # 限制 FPS 避免 CPU 忙等 (30 FPS 足够，且能大幅降温)
+                time.sleep(0.03)
             else:
                 frame = cam.camera.get_frame()
                 if frame is not None:

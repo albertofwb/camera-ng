@@ -38,6 +38,11 @@ python3 -m camera_ng shot
 python3 -m camera_ng human
 ```
 
+## 📈 性能优化记录 (2026-02-09)
+- **GPU 飞跃**：将 YOLO 推理迁移至 CUDA，追踪帧率从 ~10 FPS 飙升至 **60 FPS**。
+- **异步重构**：实现异步拉流与零延迟帧处理，彻底消除单线程阻塞。
+- **CPU 减负**：通过 30 FPS 限帧与休眠机制，总 CPU 占用率从 **55% 降至 4% 左右**（降幅达 90%+）。
+
 ## 📁 目录结构
 - `camera_ng/`：核心 Python 包。
 - `test_gpu.py`：GPU 环境验证脚本。

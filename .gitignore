@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sensitive Data - NEVER commit these!
+memory/
+*.yaml
+*.yml
+!example-config.yaml
+!pyproject.toml
+!.github/**/*.yml
+
+# Model files
+*.pt
+*.pth
+*.onnx
+*.engine
+checkpoints/
+weights/
+
+# Logs and outputs
+*.log
+logs/
+tmp/
+temp/
+/tmp/
+
+# Images and media
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.mp4
+*.avi
+*.mov
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Lock files
+*.lock
+/tmp/*.lock
+
+# Local config overrides
+.env
+.env.local

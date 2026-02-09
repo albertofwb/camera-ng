@@ -9,6 +9,7 @@ import fcntl
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 
@@ -21,9 +22,11 @@ from camera_ng import (
     TRACKER_MAX_AGE, TRACKER_MIN_HITS,
     CAPTURE_WIDTH, CAPTURE_HEIGHT, LOCK_FILE,
     CAMERA_RTSP, DEVICE_SERIAL, ACCESS_TOKEN,
-    CameraController, VisionAnalyzer, HandRaiseDetector,
+    CameraController, VisionAnalyzer, HandRaiseDetector, XiaoxiaoTTS,
     PersonTracker, TrackingMemory
 )
+
+TELEGRAM_TARGET = "1115213761"
 
 
 def validate_config():
@@ -170,11 +173,10 @@ def capture_and_send_current_view(camera: CameraController, message: str) -> boo
     print(f"📸 已抓拍当前画面: {img_path}")
 
     try:
-        target = "1115213761"
         send_cmd = [
             "openclaw", "message", "send",
             "--channel", "telegram",
-            "--target", target,
+            "--target", TELEGRAM_TARGET,
             "--media", img_path,
             "--message", message
         ]
@@ -185,6 +187,64 @@ def capture_and_send_current_view(camera: CameraController, message: str) -> boo
     except Exception as e:
         print(f"❌ 照片发送失败: {e}")
         return False
+
+
+def send_greeting_voice(tts: XiaoxiaoTTS, message: str) -> bool:
+    """发送中文问候语音到与图片相同的 Telegram 目标"""
+    try:
+        if tts.playback(message):
+            print("🔈 已在本机播放问候语音")
+        else:
+            print("⚠️ 本机语音播放失败（已继续发送 Telegram 语音）")
+
+        voice_path = tts.synthesize(message)
+        send_cmd = [
+            "openclaw", "message", "send",
+            "--channel", "telegram",
+            "--target", TELEGRAM_TARGET,
+            "--media", voice_path,
+            "--message", "右手手势语音问候",
+        ]
+        print("🔊 正在发送问候语音...")
+        subprocess.run(send_cmd, check=True)
+        print("✅ 语音发送成功！")
+        return True
+    except Exception as e:
+        print(f"❌ 语音发送失败: {e}")
+        return False
+
+
+def trigger_smart_shot_async(
+    camera: CameraController,
+    hand_text: str,
+    hand_reason: str,
+    tts: XiaoxiaoTTS | None,
+    action_lock: threading.Lock,
+) -> bool:
+    """后台执行抓拍/发送/语音，避免阻塞 tracking 主循环"""
+    if not action_lock.acquire(blocking=False):
+        print("⏳ Smart-Shot 后台任务仍在运行，跳过本次触发")
+        return False
+
+    if tts is not None and tts.is_available():
+        if tts.playback("收到"):
+            print("🔈 已本机播报: 收到")
+        else:
+            print("⚠️ 本机播报“收到”失败")
+
+    def _worker():
+        try:
+            capture_and_send_current_view(
+                camera,
+                f"Albert，我检测到你抬{hand_text}，已为你抓拍！📸",
+            )
+            if "right" in hand_reason and tts is not None and tts.is_available():
+                send_greeting_voice(tts, "嗨 Albert，你好呀，我看到你举起右手啦。")
+        finally:
+            action_lock.release()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
 
 
 def check_single_instance():
@@ -231,6 +291,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     BASE_RECENTER_Y_THRESHOLD = 0.6
 
     hand_raise_detector = HandRaiseDetector() if smart_shot else None
+    tts = XiaoxiaoTTS() if smart_shot else None
+    smart_shot_action_lock = threading.Lock()
     hand_raise_confirm_frames = 2
     hand_raise_count = 0
     shot_cooldown = 3.0
@@ -248,6 +310,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         print("📸 Smart-Shot: 右手抬起触发自动抓拍并发送")
         if hand_raise_detector is None or hand_raise_detector.model is None:
             print("⚠️ Smart-Shot pose 模型不可用，抬手检测不会触发")
+        if tts is None or not tts.is_available():
+            print("⚠️ 晓晓 TTS 不可用，右手抬起后不会发送语音")
     print("按 Ctrl+C 停止追踪")
     print("=" * 60 + "\n")
 
@@ -395,9 +459,12 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                                 hand_text = "手势"
 
                             print(f"\n   🙋 检测到{hand_text}抬起，进入 Smart-Shot（不重新找人）...")
-                            capture_and_send_current_view(
+                            trigger_smart_shot_async(
                                 cam.camera,
-                                f"Albert，我检测到你抬{hand_text}，已为你抓拍！📸",
+                                hand_text,
+                                hand_reason,
+                                tts,
+                                smart_shot_action_lock,
                             )
 
                             last_shot_time = current_time

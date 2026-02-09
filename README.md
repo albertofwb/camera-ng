@@ -27,7 +27,7 @@ python3 -m camera_ng track -g
 ```
 
 #### 🙋 Smart-Shot（右手抬起抓拍）
-基于 track 实时模式，检测到右手抬起后自动抓拍并发送：
+基于 track 实时模式，检测到抬手后自动抓拍并发送；右手抬起时额外发送中文语音问候：
 ```bash
 python3 -m camera_ng smart-shot -g
 ```

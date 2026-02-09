@@ -21,6 +21,7 @@ from .tracking import (
     PersonTracker, TrackingMemory
 )
 from .controller import CameraController
+from .tts import XiaoxiaoTTS
 
 __version__ = "2.0.0"
 __all__ = [
@@ -43,4 +44,6 @@ __all__ = [
     "PersonTracker", "TrackingMemory",
     # Controller
     "CameraController",
+    # TTS
+    "XiaoxiaoTTS",
 ]

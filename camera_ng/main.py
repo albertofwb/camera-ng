@@ -261,14 +261,17 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     time.sleep(0.5)
                     
             elif analyzing:
+                # 实时跟踪模式 - 强制异步读取最新帧
                 frame = cam.camera.get_frame()
                 if frame is None:
-                    time.sleep(0.01)
+                    time.sleep(0.001) # 极短等待，防止空循环
                     continue
                 
+                # 更新跟踪器 (YOLO推理完全在GPU上，不阻塞拉流线程)
                 tracks = tracker.update(frame)
                 main_person = tracker.get_main_person()
                 
+                # 计算并显示 FPS (识别帧率)
                 detect_mode = "DETECT" if cycle_count % detection_interval == 0 else "TRACK "
                 status = f"\r📊 [{detect_mode}] FPS:{avg_fps:.1f} | Tracks:{len(tracks)}"
                 if main_person:
@@ -283,6 +286,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     offset_x = (cx - CAPTURE_WIDTH/2) / (CAPTURE_WIDTH/2)
                     offset_y = (cy - CAPTURE_HEIGHT/2) / (CAPTURE_HEIGHT/2)
                     
+                    # 更新运动记忆
                     current_angle = cam.camera.tracking_memory.last_angle
                     if offset_x < -0.3:
                         current_angle = (current_angle - 20) % 360
@@ -290,20 +294,22 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                         current_angle = (current_angle + 20) % 360
                     cam.camera.tracking_memory.update(current_angle)
                     
+                    # 触发居中逻辑
                     if abs(offset_x) > 0.5 or abs(offset_y) > 0.6:
-                        print(f"\n   调整: 水平{offset_x:+.2f}, 垂直{offset_y:+.2f}")
+                        print(f"\n   🎯 发现大幅偏移: 水平{offset_x:+.2f}, 垂直{offset_y:+.2f}")
                         cam.camera.center_person(offset_x, offset_y)
-                        time.sleep(0.8)
+                        # 仅在调整云台后短暂停顿，其他时间全力跑
+                        time.sleep(0.5)
                     
                     lost_count = 0
                 else:
                     lost_count += 1
                     if lost_count >= LOST_THRESHOLD:
-                        print(f"\n   丢失目标，重新扫描...")
+                        print(f"\n   ⚠️ 丢失目标，重新扫描...")
                         analyzing = False
                         person_found = False
                 
-                time.sleep(0.01)
+                # 移除主循环里的 time.sleep(0.01)，让它跑得跟显卡一样快！
             else:
                 frame = cam.camera.get_frame()
                 if frame is not None:

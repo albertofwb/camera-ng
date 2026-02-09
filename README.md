@@ -1,73 +1,51 @@
-# 🦞 Camera-NG (Next Generation)
+# Camera-NG
 
-基于 **RTX 3060 Ti** 硬件加速的 Mooer 智能摄像头追踪与抓拍系统。
+Mooer 智能摄像头追踪与抓拍系统，围绕「实时找人 -> 云台跟随 -> 手势触发动作 -> 自动消息推送」设计。
 
-## 🏎️ 核心特性
-- **GPU 驱动**：利用 CUDA 12.1 加速 YOLOv8 推理，识别帧率稳定在 **60 FPS**。
-- **CPU 释放**：相比原版，CPU 负载降低约 80%+。
-- **模块化架构**：代码解耦为 `vision`, `tracking`, `stream`, `controller` 等核心模块。
-- **全自动快递**：集成 OpenClaw 命令行，抓拍后自动推送照片至 Telegram。
+技术实现、架构与依赖说明请看 `TECHNICAL.md`。
 
-## 🚀 快速开始
+## 当前已实现能力
 
-### 1. 环境准备
-确保已安装 `uv` 并处于项目根目录：
-```bash
-cd ~/camera-ng
-# 激活环境
-source .venv/bin/activate
-```
+- 实时目标跟踪：`track` 模式结合 YOLOv8 + SORT，对人物持续跟随并动态居中。
+- 智能扫描找人：支持完整步进扫描、快速扫描、带运动记忆的惯性扫描。
+- Smart-Shot 手势联动：右手抬起触发抓拍+Telegram 发送；左手抬起切换录像开关。
+- 录像管理：`ffmpeg` 后台录制，输出到 `~/Desktop/capture/<timestamp>.mp4`，丢失目标时自动停录。
+- 语音能力：支持本地 TTS 播报（晓晓），并可将语音文件发送到 Telegram。
+- 高质量抓拍：支持从 RTSP 原流单帧抓图，支持独立照片分辨率/质量配置。
+- 单实例保护：使用 `/tmp/mooer_camera.lock` 防止多进程同时控制同一云台。
 
-### 2. 常用命令
-
-#### 🏎️ 实时 GPU 追踪 (最推荐)
-开启实时目标跟踪模式，模型完全运行在显卡上：
-```bash
-python3 -m camera_ng track -g
-```
-
-#### 🙋 Smart-Shot（手势联动）
-基于 track 实时模式，支持抬手触发不同动作（全程保持追踪）：
-- **右手抬起**：高质量抓拍并发送 Telegram；本机先播报「收到」，随后后台发送问候语音。
-- **左手抬起**：开始/停止高质量录像；录像文件自动保存到 `~/Desktop/capture/<timestamp>.mp4`。
-- **录像策略**：仅左手抬起才开始录像；丢失目标时自动停止（不再“找到目标即自动开录”）。
-- **跟踪稳定性优化**：手势识别改为按时间限频 + 人体 ROI 检测；找到目标后先稳定 `0.3s` 再允许云台移动，减少“刚找到又丢失”的抖动。
+## 命令速查
 
 ```bash
-python3 -m camera_ng smart-shot -g
-```
+# 显示帮助
+python3 -m camera_ng -h
 
-高灵敏模式（更快响应，更耗电）：
-```bash
-python3 -m camera_ng smart-shot -g -quick
-```
-
-追踪模式同样支持 `-quick`：
-```bash
-python3 -m camera_ng track -g -quick
-```
-
-#### 📸 智能居中抓拍
-自动寻找人物，居中对齐，稳定 2 秒后抓拍并发送至手机：
-```bash
-python3 -m camera_ng shot
-```
-
-#### 🔍 传统扫描找人
-仅执行水平+垂直（3层限制）扫描：
-```bash
+# 传统扫描找人
 python3 -m camera_ng human
+
+# 实时跟踪（可加 -g 启用 GPU 解码）
+python3 -m camera_ng track -g
+
+# Smart-Shot：跟踪 + 手势触发抓拍/录像
+python3 -m camera_ng smart-shot -g
+
+# 快速高灵敏模式（track / smart-shot 都支持）
+python3 -m camera_ng smart-shot -g -quick
+
+# 找人 -> 居中 -> 抓拍并发送
+python3 -m camera_ng shot
+
+# 临时指定云台转速（度/秒）
+python3 -m camera_ng track --speed 30
+
+# 调用外部校准脚本
+python3 -m camera_ng calibrate
 ```
 
-## 📈 性能优化记录 (2026-02-09)
-- **GPU 飞跃**：将 YOLO 推理迁移至 CUDA，追踪帧率从 ~10 FPS 飙升至 **60 FPS**。
-- **异步重构**：实现异步拉流与零延迟帧处理，彻底消除单线程阻塞。
-- **CPU 减负**：通过 30 FPS 限帧与休眠机制，总 CPU 占用率从 **55% 降至 4% 左右**（降幅达 90%+）。
+## 快速开始
 
-## 📁 目录结构
-- `camera_ng/`：核心 Python 包。
-- `test_gpu.py`：GPU 环境验证脚本。
-- `pyproject.toml`：项目依赖管理。
+1. 准备配置文件（`camera.rtsp_url` / `camera.device_serial` / `camera.access_token` 为必填）。
+2. 运行 `python3 -m camera_ng track -g` 验证实时跟踪。
+3. 运行 `python3 -m camera_ng smart-shot -g` 体验手势联动抓拍与录像。
 
----
-*Powered by Mooer & Albert 💕*
+配置模板、搜索路径、依赖安装、模块架构请参考 `TECHNICAL.md`。

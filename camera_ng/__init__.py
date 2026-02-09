@@ -22,6 +22,10 @@ from .tracking import (
 )
 from .controller import CameraController
 from .tts import XiaoxiaoTTS
+from .handlers import (
+    HandGestureHandler, HandGesture, GestureEvent,
+    RecordingManager, SmartShotWorker,
+)
 
 __version__ = "2.0.0"
 __all__ = [
@@ -46,4 +50,7 @@ __all__ = [
     "CameraController",
     # TTS
     "XiaoxiaoTTS",
+    # Handlers
+    "HandGestureHandler", "HandGesture", "GestureEvent",
+    "RecordingManager", "SmartShotWorker",
 ]

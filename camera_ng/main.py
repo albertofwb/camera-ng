@@ -7,10 +7,8 @@ Mooer Camera NG - 主入口
 import faulthandler
 import fcntl
 import os
-import queue
 import subprocess
 import sys
-import threading
 import time
 from collections import deque
 
@@ -25,6 +23,10 @@ from camera_ng import (
     CAMERA_RTSP, DEVICE_SERIAL, ACCESS_TOKEN,
     CameraController, VisionAnalyzer, HandRaiseDetector, XiaoxiaoTTS,
     PersonTracker, TrackingMemory
+)
+from camera_ng.handlers import (
+    HandGestureHandler, HandGesture,
+    RecordingManager, SmartShotWorker,
 )
 
 TELEGRAM_TARGET = "1115213761"
@@ -85,10 +87,6 @@ camera:
 """)
         print("=" * 60)
         sys.exit(1)
-
-
-# 启动时验证配置
-validate_config()
 
 
 class SmartCamera:
@@ -183,10 +181,24 @@ class SingleInstanceLock:
         self.release()
 
 
-def capture_and_send_current_view(camera: CameraController, message: str) -> bool:
-    """基于当前画面直接抓拍并发送，不执行找人流程"""
-    img_path = camera.capture(full_quality=True)
-    print(f"📸 已抓拍当前画面: {img_path}")
+def capture_and_send_current_view(
+    camera: CameraController,
+    message: str,
+    send_to_tg: bool = False,
+) -> bool:
+    """基于当前画面抓拍；可选发送 Telegram"""
+    output_dir = os.path.expanduser("~/Desktop/capture/pictures")
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    ms = int((time.time() % 1) * 1000)
+    img_path = os.path.join(output_dir, f"{timestamp}_{ms:03d}.jpg")
+
+    camera.capture(output_path=img_path, full_quality=True)
+    print(f"📸 已保存高质量抓拍: {img_path}")
+
+    if not send_to_tg:
+        print("📭 Telegram 发送已关闭（使用 --tg 开启）")
+        return True
 
     try:
         send_cmd = [
@@ -206,13 +218,17 @@ def capture_and_send_current_view(camera: CameraController, message: str) -> boo
         return False
 
 
-def send_greeting_voice(tts: XiaoxiaoTTS, message: str) -> bool:
-    """发送中文问候语音到与图片相同的 Telegram 目标"""
+def send_greeting_voice(tts: XiaoxiaoTTS, message: str, send_to_tg: bool = False) -> bool:
+    """发送中文问候语音（可选 Telegram）"""
     try:
         if tts.playback(message):
             print("🔈 已在本机播放问候语音")
         else:
             print("⚠️ 本机语音播放失败（已继续发送 Telegram 语音）")
+
+        if not send_to_tg:
+            print("📭 Telegram 语音发送已关闭（使用 --tg 开启）")
+            return True
 
         voice_path = tts.synthesize(message)
         send_cmd = [
@@ -232,140 +248,34 @@ def send_greeting_voice(tts: XiaoxiaoTTS, message: str) -> bool:
         return False
 
 
-def start_high_quality_recording() -> tuple[subprocess.Popen[str] | None, str | None]:
-    """启动高质量录像并返回 ffmpeg 进程与输出路径"""
-    try:
-        output_dir = os.path.expanduser("~/Desktop/capture")
-        os.makedirs(output_dir, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(output_dir, f"{timestamp}.mp4")
-
-        cmd = [
-            "ffmpeg",
-            "-rtsp_transport",
-            "tcp",
-            "-i",
-            CAMERA_RTSP,
-            "-c",
-            "copy",
-            "-movflags",
-            "+faststart",
-            "-y",
-            output_path,
-        ]
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        print(f"🎬 左手触发：开始录像 {output_path}")
-        return proc, output_path
-    except Exception as e:
-        print(f"❌ 启动录像失败: {e}")
-        return None, None
+# 已迁移到 handlers.py
 
 
-def stop_high_quality_recording(record_proc: subprocess.Popen[str] | None, output_path: str | None) -> None:
-    """停止录像并落盘"""
-    if record_proc is None:
-        return
-
-    proc = record_proc
-    try:
-        if proc.poll() is None:
-            if proc.stdin is not None:
-                proc.stdin.write("q\n")
-                proc.stdin.flush()
-            proc.wait(timeout=2.0)
-    except Exception:
-        try:
-            proc.terminate()
-            proc.wait(timeout=1.5)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    finally:
-        if output_path:
-            print(f"✅ 左手触发：停止录像，已保存 {output_path}")
+# 已迁移到 handlers.py
 
 
-def local_voice_broadcast(tts: XiaoxiaoTTS | None, text: str) -> None:
-    """本机语音播报（后台执行，不阻塞录像/追踪）"""
-    if tts is None or not tts.is_available():
-        return
-
-    def _worker() -> None:
-        try:
-            ok = tts.playback(text)
-            if ok:
-                print(f"🔈 语音播报: {text}")
-        except Exception:
-            pass
-
-    threading.Thread(target=_worker, daemon=True).start()
-
-
-def start_smart_shot_worker(
-    camera: CameraController,
-    tts: XiaoxiaoTTS | None,
-    task_queue: queue.Queue,
-    stop_event: threading.Event,
-) -> threading.Thread:
-    """启动 Smart-Shot 后台 worker（串行消费队列任务）"""
-
-    def _worker():
-        while not stop_event.is_set():
-            try:
-                hand_text, hand_reason = task_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            try:
-                capture_and_send_current_view(
-                    camera,
-                    f"Albert，我检测到你抬{hand_text}，已为你抓拍！📸",
-                )
-                if "right" in hand_reason and tts is not None and tts.is_available():
-                    send_greeting_voice(tts, "嗨 Albert，你好呀，我看到你举起右手啦。")
-            finally:
-                task_queue.task_done()
-
-    worker = threading.Thread(target=_worker, daemon=True)
-    worker.start()
-    return worker
-
-
-def trigger_smart_shot_async(
-    hand_text: str,
-    hand_reason: str,
-    tts: XiaoxiaoTTS | None,
-    task_queue: queue.Queue,
+def handle_gesture_event(
+    event,
+    recording_mgr: RecordingManager | None,
+    smart_shot_worker: SmartShotWorker,
+    current_time: float,
 ) -> bool:
-    """入队 Smart-Shot 任务，主循环不阻塞（满队列时丢弃最旧任务）"""
+    """处理手势事件，返回是否成功处理"""
+    from camera_ng.handlers import HandGesture
 
-    if task_queue.full():
-        try:
-            _ = task_queue.get_nowait()
-            task_queue.task_done()
-            print("🗑️ Smart-Shot 队列已满，丢弃最旧任务（drop_oldest）")
-        except queue.Empty:
-            pass
-
-    try:
-        task_queue.put_nowait((hand_text, hand_reason))
-        if tts is not None and tts.is_available():
-            if tts.playback("收到"):
-                print("🔈 已本机播报: 收到")
-            else:
-                print("⚠️ 本机播报“收到”失败")
-        return True
-    except queue.Full:
-        print("⏳ Smart-Shot 队列拥塞，跳过本次触发")
+    if event.gesture == HandGesture.LEFT_HAND:
+        # 左手控制录像开关
+        if recording_mgr is not None:
+            recording_mgr.toggle(current_time)
+            return True
         return False
+
+    elif event.gesture == HandGesture.RIGHT_HAND:
+        # 右手触发 Smart-Shot
+        print("\n   🙋 检测到右手抬起，触发 Smart-Shot...")
+        return smart_shot_worker.submit("右手", event.reason)
+
+    return False
 
 
 def check_single_instance():
@@ -384,8 +294,9 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                          detection_interval: int = DETECTION_INTERVAL,
                          use_gpu: bool = False,
                          smart_shot: bool = False,
-                         quick_mode: bool = False) -> None:
-    """实时目标跟踪模式"""
+                         quick_mode: bool = False,
+                         send_to_tg: bool = False) -> None:
+    """实时目标跟踪模式 - 使用重构后的处理器"""
     cam = SmartCamera()
     effective_detection_interval = 1 if quick_mode else detection_interval
     tracker = PersonTracker(
@@ -393,45 +304,74 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         confidence=0.5,
         detection_interval=effective_detection_interval
     )
-    
+
+    # 状态管理
     cycle_count = 0
     person_found = False
     analyzing = False
     lost_count = 0
     LOST_THRESHOLD = 5
-    
+
     fps_history = deque(maxlen=30)
     last_time = time.time()
     offset_x_history = deque(maxlen=5)
     offset_y_history = deque(maxlen=5)
     recenter_candidate_count = 0
     last_recenter_time = 0.0
+    post_found_settle_until = 0.0
 
-    # 抗抖参数：避免“转头/喝水”这类短时姿态变化触发云台
+    # 云台控制参数
     RECENTER_CONFIRM_FRAMES = 3
     RECENTER_COOLDOWN = 1.2
     BASE_RECENTER_X_THRESHOLD = 0.5
     BASE_RECENTER_Y_THRESHOLD = 0.6
+    POST_FOUND_SETTLE_SEC = 0.3
 
-    hand_raise_detector = HandRaiseDetector() if smart_shot else None
+    # Smart-Shot 组件
     tts = XiaoxiaoTTS() if smart_shot else None
-    smart_shot_queue = queue.Queue(maxsize=3) if smart_shot else None
-    smart_shot_stop_event = threading.Event() if smart_shot else None
-    smart_shot_worker = (
-        start_smart_shot_worker(cam.camera, tts, smart_shot_queue, smart_shot_stop_event)
-        if smart_shot and smart_shot_queue is not None and smart_shot_stop_event is not None
-        else None
+    hand_detector = HandRaiseDetector() if smart_shot else None
+    gesture_handler = (
+        HandGestureHandler(
+            detector=hand_detector,
+            confirm_frames=1 if quick_mode else 2,
+            release_frames=2 if quick_mode else 3,
+            cooldown_sec=0.6 if quick_mode else 1.0,
+            log_interval_sec=0.5 if quick_mode else 1.0,
+            detect_interval_sec=0.12 if quick_mode else 0.25,
+        )
+        if smart_shot and hand_detector else None
     )
-    hand_raise_confirm_frames = 1 if quick_mode else 2
-    hand_raise_count = 0
-    shot_cooldown = 0.6 if quick_mode else 1.0
-    last_shot_time = 0.0
-    last_hand_log_time = 0.0
-    hand_trigger_armed = True
-    record_proc: subprocess.Popen[str] | None = None
-    record_output_path: str | None = None
-    record_toggle_cooldown = 1.5
-    last_record_toggle_time = 0.0
+    recording_mgr = (
+        RecordingManager(
+            rtsp_url=CAMERA_RTSP,
+            tts=tts,
+            toggle_cooldown_sec=1.5,
+            auto_start_on_person_found=False,
+        )
+        if smart_shot else None
+    )
+    def smart_shot_task_callback(camera, hand_text, hand_reason, tts_instance):
+        """Smart-Shot 任务回调"""
+        capture_and_send_current_view(
+            camera,
+            f"Albert，我检测到你抬{hand_text}，已为你抓拍！📸",
+            send_to_tg=send_to_tg,
+        )
+
+    smart_shot_worker = (
+        SmartShotWorker(
+            camera=cam.camera,
+            tts=tts,
+            telegram_target=TELEGRAM_TARGET,
+            max_queue_size=3,
+            task_callback=smart_shot_task_callback,
+        )
+        if smart_shot else None
+    )
+
+    if smart_shot and smart_shot_worker:
+        smart_shot_worker.start()
+
     frame_sleep = 0.005 if quick_mode else 0.03
     recenter_pause = 0.2 if quick_mode else 0.5
 
@@ -443,12 +383,16 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     print(f"跟踪器: SORT (max_age={TRACKER_MAX_AGE}, min_hits={TRACKER_MIN_HITS})")
     print(f"视频解码: {'GPU (CUDA)' if use_gpu else 'CPU'}")
     if smart_shot:
-        print("📸 Smart-Shot: 右手抬起抓拍发送，左手抬起开始/停止录像")
-        if hand_raise_detector is None or hand_raise_detector.model is None:
+        print("📸 Smart-Shot: 右手异步保存高质量抓拍，左手抬起开始/停止录像")
+        print("🖼️ 抓拍目录: ~/Desktop/capture/pictures")
+        print(f"📨 Telegram 发送: {'开启' if send_to_tg else '关闭（默认）'}")
+        if hand_detector is None or hand_detector.model is None:
             print("⚠️ Smart-Shot pose 模型不可用，抬手检测不会触发")
         if tts is None or not tts.is_available():
             print("⚠️ 晓晓 TTS 不可用，右手抬起后不会发送语音")
         print("📬 Smart-Shot 队列策略: drop_oldest（队列满时丢弃最旧任务）")
+        print(f"🙋 手势检测频率: 每 {0.12 if quick_mode else 0.25:.2f}s 一次（降低跟踪卡顿）")
+        print("🎬 录像策略: 仅左手抬起开始，丢失目标时自动停止")
     if quick_mode:
         print("⚡ Quick 模式: 高频检测 + 更低冷静时间")
     print("按 Ctrl+C 停止追踪")
@@ -462,12 +406,13 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         while True:
             cycle_count += 1
             current_time = time.time()
-            
+
             fps_history.append(1.0 / (current_time - last_time + 0.001))
             avg_fps = sum(fps_history) / len(fps_history)
             last_time = current_time
 
             if not person_found:
+                # 扫描找人
                 print(f"\n{'=' * 60}")
                 print(f"🔄 第 {cycle_count} 轮 | 执行智能扫描...")
                 print(f"{'=' * 60}")
@@ -477,15 +422,16 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                 if person_found:
                     print("✅ 找到目标！")
                     cam.camera.tracking_memory.reset()
-                    
+
                     if not cam.camera.stream_active:
                         if not cam.camera.start_stream():
                             return
                         time.sleep(0.5)
 
+                    # 初始化跟踪
                     init_attempts = 0
                     max_init_attempts = 10
-                    
+
                     while init_attempts < max_init_attempts:
                         frame = cam.camera.get_frame()
                         if frame is not None:
@@ -502,33 +448,30 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
                     analyzing = True
                     lost_count = 0
+                    post_found_settle_until = time.time() + POST_FOUND_SETTLE_SEC
+                    print(f"⏸️ 找到目标后稳定 {POST_FOUND_SETTLE_SEC:.1f}s，再执行移动")
+
+                    # 找到目标：按配置决定是否自动开始录像
+                    if recording_mgr:
+                        recording_mgr.on_person_found()
                 else:
                     print("未找到，继续扫描...")
                     if not cam.camera.start_stream():
                         cam.camera.start_stream()
                     time.sleep(0.5)
-                    
+
             elif analyzing:
-                # 实时跟踪模式 - 强制异步读取最新帧
+                # 实时跟踪模式
                 frame = cam.camera.get_frame()
                 if frame is None:
-                    time.sleep(0.001) # 极短等待，防止空循环
+                    time.sleep(0.001)
                     continue
-                
-                # 更新跟踪器 (YOLO推理完全在GPU上，不阻塞拉流线程)
+
                 tracks = tracker.update(frame)
                 main_person = tracker.get_main_person()
-                
-                # 计算并显示 FPS (识别帧率)
-                detect_mode = "DETECT" if cycle_count % effective_detection_interval == 0 else "TRACK "
-                status = f"\r📊 [{detect_mode}] FPS:{avg_fps:.1f} | Tracks:{len(tracks)}"
+
                 if main_person:
-                    cx, cy = main_person.bbox[[0, 2]].mean(), main_person.bbox[[1, 3]].mean()
-                    offset_x = (cx - CAPTURE_WIDTH/2) / (CAPTURE_WIDTH/2)
-                    status += f" | MainID:{main_person.id} offset:{offset_x:+.2f}"
-                print(status, end="", flush=True)
-                
-                if main_person:
+                    # 计算偏移并平滑
                     cx = (main_person.bbox[0] + main_person.bbox[2]) / 2
                     cy = (main_person.bbox[1] + main_person.bbox[3]) / 2
                     offset_x = (cx - CAPTURE_WIDTH/2) / (CAPTURE_WIDTH/2)
@@ -538,7 +481,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     offset_y_history.append(offset_y)
                     smoothed_offset_x = sum(offset_x_history) / len(offset_x_history)
                     smoothed_offset_y = sum(offset_y_history) / len(offset_y_history)
-                    
+
                     # 更新运动记忆
                     current_angle = cam.camera.tracking_memory.last_angle
                     if smoothed_offset_x < -0.3:
@@ -546,8 +489,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     elif smoothed_offset_x > 0.3:
                         current_angle = (current_angle + 20) % 360
                     cam.camera.tracking_memory.update(current_angle)
-                    
-                    # 触发居中逻辑（连续多帧 + 平滑 + 冷却）
+
+                    # 居中逻辑
                     person_width_ratio = (main_person.bbox[2] - main_person.bbox[0]) / CAPTURE_WIDTH
                     dynamic_x_threshold = BASE_RECENTER_X_THRESHOLD + min(0.25, person_width_ratio * 0.35)
                     need_recenter = (
@@ -560,88 +503,83 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     else:
                         recenter_candidate_count = 0
 
+                    if current_time < post_found_settle_until:
+                        recenter_candidate_count = 0
+
                     if (
                         recenter_candidate_count >= RECENTER_CONFIRM_FRAMES
                         and (current_time - last_recenter_time) >= RECENTER_COOLDOWN
+                        and current_time >= post_found_settle_until
                     ):
-                        print(
-                            f"\n   🎯 持续偏移触发居中: 水平{smoothed_offset_x:+.2f}, 垂直{smoothed_offset_y:+.2f}"
-                        )
+                        print(f"\n   🎯 持续偏移触发居中: 水平{smoothed_offset_x:+.2f}, 垂直{smoothed_offset_y:+.2f}")
                         cam.camera.center_person(smoothed_offset_x, smoothed_offset_y)
                         recenter_candidate_count = 0
                         last_recenter_time = current_time
                         offset_x_history.clear()
                         offset_y_history.clear()
-                        # 仅在调整云台后短暂停顿，其他时间全力跑
                         time.sleep(recenter_pause)
 
-                    if smart_shot and hand_raise_detector is not None and smart_shot_queue is not None:
-                        hand_raised, hand_reason = hand_raise_detector.get_hand_raise_state(frame)
-                        if hand_raised:
-                            hand_raise_count = min(hand_raise_count + 1, hand_raise_confirm_frames)
-                        else:
-                            hand_raise_count = max(hand_raise_count - 1, 0)
-                            if hand_raise_count == 0:
-                                hand_trigger_armed = True
+                    # 手势检测
+                    if gesture_handler and smart_shot_worker:
+                        x1, y1, x2, y2 = [int(v) for v in main_person.bbox]
+                        box_w = max(1, x2 - x1)
+                        box_h = max(1, y2 - y1)
+                        pad_x = int(box_w * 0.2)
+                        pad_y = int(box_h * 0.25)
 
-                        if (current_time - last_hand_log_time) >= 2.0:
-                            print(f"\n   🙋 手势检测: {hand_reason} | 连续帧: {hand_raise_count}/{hand_raise_confirm_frames}")
-                            last_hand_log_time = current_time
+                        gx1 = max(0, x1 - pad_x)
+                        gy1 = max(0, y1 - pad_y)
+                        gx2 = min(frame.shape[1], x2 + pad_x)
+                        gy2 = min(frame.shape[0], y2 + pad_y)
 
-                        if (
-                            hand_trigger_armed
-                            and hand_raised
-                            and hand_raise_count >= hand_raise_confirm_frames
-                            and (current_time - last_shot_time) >= shot_cooldown
-                        ):
-                            if "left" in hand_reason:
-                                if (current_time - last_record_toggle_time) >= record_toggle_cooldown:
-                                    if record_proc is None or record_proc.poll() is not None:
-                                        record_proc, record_output_path = start_high_quality_recording()
-                                        if record_proc is not None:
-                                            local_voice_broadcast(tts, "开始录像")
-                                    else:
-                                        stop_high_quality_recording(record_proc, record_output_path)
-                                        local_voice_broadcast(tts, "停止录像")
-                                        record_proc = None
-                                        record_output_path = None
-                                    last_record_toggle_time = current_time
-                                hand_raise_count = 0
-                                hand_trigger_armed = False
-                                continue
+                        gesture_frame = frame[gy1:gy2, gx1:gx2]
+                        if gesture_frame.size == 0:
+                            gesture_frame = frame
 
-                            if "right" not in hand_reason:
-                                hand_raise_count = 0
-                                hand_trigger_armed = False
-                                continue
+                        event = gesture_handler.update(gesture_frame, current_time)
 
-                            print("\n   🙋 检测到右手抬起，进入 Smart-Shot（不重新找人）...")
-                            started = trigger_smart_shot_async(
-                                "右手",
-                                hand_reason,
-                                tts,
-                                smart_shot_queue,
+                        # 日志输出
+                        if gesture_handler.should_log(current_time):
+                            hand_raised, reason, count = gesture_handler.get_status()
+                            status_icon = "✓" if hand_raised else "✗"
+                            confirm_frames = gesture_handler.confirm_frames
+                            print(f"\n   🙋 手势: {reason} [当前帧:{status_icon}] | 连续: {count}/{confirm_frames}")
+
+                        # 处理触发事件
+                        if event:
+                            handle_gesture_event(
+                                event,
+                                recording_mgr,
+                                smart_shot_worker,
+                                current_time,
                             )
-                            if started:
-                                last_shot_time = current_time
-                                hand_raise_count = 0
-                                hand_trigger_armed = False
-                    
+
                     lost_count = 0
                 else:
+                    # 丢失目标处理
                     recenter_candidate_count = 0
                     offset_x_history.clear()
                     offset_y_history.clear()
+
+                    if current_time < post_found_settle_until:
+                        time.sleep(frame_sleep)
+                        continue
+
                     lost_count += 1
+
                     if lost_count >= LOST_THRESHOLD:
-                        hand_raise_count = 0
                         print(f"\n   ⚠️ 丢失目标，重新扫描...")
+                        if gesture_handler:
+                            gesture_handler.reset()
+                        if recording_mgr:
+                            recording_mgr.on_person_lost()
                         analyzing = False
                         person_found = False
-                
-                # 限制 FPS 避免 CPU 忙等
+
                 time.sleep(frame_sleep)
+
             else:
+                # 非分析模式，仅检查跟踪状态
                 frame = cam.camera.get_frame()
                 if frame is not None:
                     tracks = tracker.update(frame)
@@ -650,18 +588,18 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     else:
                         lost_count += 1
                         if lost_count >= LOST_THRESHOLD:
+                            if recording_mgr:
+                                recording_mgr.on_person_lost()
                             person_found = False
                 time.sleep(TRACK_CHECK_INTERVAL)
 
     except KeyboardInterrupt:
         print("\n\n停止追踪...")
     finally:
-        if record_proc is not None:
-            stop_high_quality_recording(record_proc, record_output_path)
-        if smart_shot_stop_event is not None:
-            smart_shot_stop_event.set()
-        if smart_shot_worker is not None:
-            smart_shot_worker.join(timeout=0.5)
+        if recording_mgr:
+            recording_mgr.cleanup()
+        if smart_shot_worker:
+            smart_shot_worker.stop()
         cam.camera.stop_stream()
         print("\n追踪已停止")
         print(f"   共执行 {cycle_count} 轮")
@@ -670,23 +608,35 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 def show_help():
     """显示帮助信息"""
     print("Mooer Camera NG - 智能视角控制系统")
-    print("\n用法: python3 -m camera_ng <命令> [选项] [步数] [角度]")
+    print("\n用法:")
+    print("  python3 -m camera_ng --help")
+    print("  python3 -m camera_ng <命令> [选项] [步数] [角度]")
+    print("  python3 -m camera_ng <命令> --help")
     print("\n可用命令:")
     print("  human [选项] [步数] [角度]  - 多步扫描找人")
     print("  track [选项] [步数] [角度]  - 实时跟踪模式")
-    print("  smart-shot [选项]           - 跟踪+右手抬起自动抓拍发送")
+    print("  smart-shot [选项]           - 跟踪+右手抓拍(异步保存)+左手录像")
     print("  shot [步数] [角度]          - 拍照并发送")
+    print("  prepare-tts [选项]          - 预生成常用本机提示音到 media/tts")
     print("  calibrate                   - 校准云台转速")
     print("\n选项:")
     print("  -h, --help                  - 显示帮助信息")
     print("  -g, --gpu                   - 使用 GPU 硬解")
     print("  -quick, --quick             - 高性能模式（更灵敏，更耗电）")
+    print("  --tg, --telegram            - 开启 Telegram 发送（默认关闭）")
+    print("  --overwrite                 - 仅用于 prepare-tts，覆盖已有音频")
     print("  --speed <度/秒>             - 指定转速")
     print("\n示例:")
     print("  python3 -m camera_ng human          # 默认扫描")
     print("  python3 -m camera_ng track -g       # GPU 实时跟踪")
     print("  python3 -m camera_ng smart-shot -g -quick  # 高灵敏手势抓拍")
-    print("  python3 -m camera_ng shot 8 180     # 拍照模式")
+    print("  python3 -m camera_ng smart-shot -g --tg     # 开启 Telegram 发送")
+    print("  python3 -m camera_ng shot 8 180 --tg         # 拍照并发送")
+    print("  python3 -m camera_ng prepare-tts             # 预生成本地提示音")
+    print("\nSmart-Shot 行为:")
+    print("  - 右手抬起：异步保存高质量照片到 ~/Desktop/capture/pictures/<timestamp>.jpg")
+    print("  - 左手抬起：开始/停止录像")
+    print("  - Telegram 默认关闭；加 --tg 才发送")
 
 
 def main():
@@ -697,6 +647,10 @@ def main():
 
     cmd = sys.argv[1]
     args = sys.argv[2:]
+
+    if "-h" in args or "--help" in args:
+        show_help()
+        sys.exit(0)
 
     # 解析 GPU 选项
     use_gpu = False
@@ -710,6 +664,17 @@ def main():
         quick_mode = True
         args = [a for a in args if a not in ["-quick", "--quick"]]
 
+    # 解析 Telegram 发送选项
+    send_to_tg = False
+    if "--tg" in args or "--telegram" in args:
+        send_to_tg = True
+        args = [a for a in args if a not in ["--tg", "--telegram"]]
+
+    overwrite_tts = False
+    if "--overwrite" in args:
+        overwrite_tts = True
+        args = [a for a in args if a != "--overwrite"]
+
     # 解析转速选项
     global ROTATION_SPEED
     if "--speed" in args:
@@ -719,10 +684,14 @@ def main():
             print(f"⚙️  使用指定转速: {ROTATION_SPEED}°/s")
             args = args[:speed_idx] + args[speed_idx + 2:]
 
-    num_steps = int(args[0]) if len(args) > 0 else DEFAULT_NUM_STEPS
-    total_angle = float(args[1]) if len(args) > 1 else DEFAULT_TOTAL_ANGLE
+    num_steps = int(args[0]) if len(args) > 0 and args[0].lstrip("-").isdigit() else DEFAULT_NUM_STEPS
+    total_angle = float(args[1]) if len(args) > 1 and args[1].replace(".", "", 1).lstrip("-").isdigit() else DEFAULT_TOTAL_ANGLE
 
-    lock = check_single_instance()
+    config_required_cmds = {"human", "shot", "track", "smart-shot"}
+    if cmd in config_required_cmds:
+        validate_config()
+
+    lock = check_single_instance() if cmd in config_required_cmds else None
 
     cam = None
     try:
@@ -739,7 +708,11 @@ def main():
             result = cam.human(num_steps=num_steps, total_angle=total_angle, 
                              use_gpu=use_gpu, center_and_wait=True)
             if result:
-                capture_and_send_current_view(cam.camera, "Albert，我抓拍到你啦！📸💕")
+                capture_and_send_current_view(
+                    cam.camera,
+                    "Albert，我抓拍到你啦！📸💕",
+                    send_to_tg=send_to_tg,
+                )
                     
             print(f"\n{'='*60}")
             print(f"拍照结果: {'成功' if result else '未找到人'}")
@@ -752,6 +725,7 @@ def main():
                 total_angle=total_angle,
                 use_gpu=use_gpu,
                 quick_mode=quick_mode,
+                send_to_tg=send_to_tg,
             )
 
         elif cmd == "smart-shot":
@@ -761,16 +735,28 @@ def main():
                 use_gpu=use_gpu,
                 smart_shot=True,
                 quick_mode=quick_mode,
+                send_to_tg=send_to_tg,
             )
+
+        elif cmd == "prepare-tts":
+            tts = XiaoxiaoTTS()
+            created, skipped = tts.pregenerate_common_prompts(overwrite=overwrite_tts)
+            print("\n" + "=" * 60)
+            print("🔊 预生成提示音完成")
+            print(f"   目录: {tts.media_dir}")
+            print(f"   新生成: {created}")
+            print(f"   跳过: {skipped}")
+            print("=" * 60)
             
         elif cmd == "calibrate":
             subprocess.run(["python3", "/home/albert/clawd/scripts/calibrate_speed.py"])
         else:
             print(f"未知命令: {cmd}")
-            print("支持命令: human, shot, track, smart-shot, calibrate")
+            print("支持命令: human, shot, track, smart-shot, prepare-tts, calibrate")
             sys.exit(1)
     finally:
-        lock.release()
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":

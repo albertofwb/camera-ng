@@ -168,10 +168,11 @@ class HandRaiseDetector:
     RIGHT_SHOULDER_IDX = 6
     RIGHT_WRIST_IDX = 10
 
-    def __init__(self, model_name: str = "yolov8n-pose"):
+    def __init__(self, model_name: str = "yolov8n-pose", infer_imgsz: int = 320):
         self.model = None
         self._lock = threading.Lock()
         self.device = "cuda"
+        self.infer_imgsz = infer_imgsz
 
         if YOLO_AVAILABLE:
             try:
@@ -184,7 +185,7 @@ class HandRaiseDetector:
     def get_hand_raise_state(
         self,
         frame: np.ndarray,
-        conf_threshold: float = 0.2,
+        conf_threshold: float = 0.35,
     ) -> tuple[bool, str]:
         """检测画面主人物是否抬手（右手/左手任一）"""
         if self.model is None:
@@ -192,7 +193,12 @@ class HandRaiseDetector:
 
         with self._lock:
             try:
-                results = self.model(frame, verbose=False, device=self.device)
+                results = self.model(
+                    frame,
+                    verbose=False,
+                    device=self.device,
+                    imgsz=self.infer_imgsz,
+                )
                 if not results:
                     return False, "no pose result"
 
@@ -245,12 +251,27 @@ class HandRaiseDetector:
                     left_wrist_y = float(left_wrist[1])
                     left_raised = left_wrist_y < (left_shoulder_y - margin)
 
-                if right_raised:
-                    return True, "right hand raised"
-                if left_raised:
-                    return True, "left hand raised"
+                # 调试信息：返回详细的关节点状态
+                debug_parts = []
+                if right_valid:
+                    debug_parts.append(f"RS={shoulder_y:.1f},RW={wrist_y:.1f}")
+                else:
+                    debug_parts.append("right_invalid")
+                if left_valid:
+                    debug_parts.append(f"LS={left_shoulder_y:.1f},LW={left_wrist_y:.1f}")
+                else:
+                    debug_parts.append("left_invalid")
+                debug_parts.append(f"margin={margin:.1f}")
+                if kpt_conf is not None:
+                    debug_parts.append(f"conf={float(kpt_conf[self.RIGHT_WRIST_IDX]):.2f}")
+                debug_info = ",".join(debug_parts)
 
-                return False, "hands below threshold"
+                if right_raised:
+                    return True, f"right hand raised ({debug_info})"
+                if left_raised:
+                    return True, f"left hand raised ({debug_info})"
+
+                return False, f"hands below threshold ({debug_info})"
             except Exception as e:
                 print(f"⚠️  HandRaise detection error: {e}")
                 return False, str(e)

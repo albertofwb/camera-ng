@@ -12,13 +12,16 @@ import urllib.request
 import urllib.parse
 from typing import Optional, TYPE_CHECKING
 
+import numpy as np
+
 from .config import (
     CAMERA_RTSP, CAPTURE_SEEK_TIME, CAPTURE_WIDTH, CAPTURE_HEIGHT, CAPTURE_QUALITY,
     PHOTO_WIDTH, PHOTO_HEIGHT, PHOTO_QUALITY,
-    DEVICE_SERIAL, ACCESS_TOKEN, ROTATION_SPEED,
+    DEVICE_SERIAL, ACCESS_TOKEN, ROTATION_SPEED, PTZ_SPEED,
     LEFT_LIMIT_STEP_DURATION, TURN_STABILIZE_TIME,
     CENTER_THRESHOLD, MAX_CENTER_ADJUST,
     DETECTION_SLEEP_TIME, TRACK_SCAN_DELAY,
+    STREAM_LOW_LATENCY,
     DIR_LEFT_CODE, DIR_RIGHT_CODE, DIR_UP_CODE, DIR_DOWN_CODE,
     PTZ_ERROR_CODES
 )
@@ -41,8 +44,15 @@ class CameraController:
         self.hit_down_limit = False
         self._ptz_lock = threading.Lock()
         self.center_and_wait_mode = False
+        self.ptz_speed_default = int(PTZ_SPEED)
 
-    def start_stream(self, use_gpu: bool = False, force_restart: bool = False) -> bool:
+    def start_stream(
+        self,
+        use_gpu: bool = False,
+        force_restart: bool = False,
+        rtsp_url: Optional[str] = None,
+        low_latency: Optional[bool] = None,
+    ) -> bool:
         """启动实时视频流（支持复用）"""
         if self.stream_active and self.video_stream is not None and not force_restart:
             return True
@@ -50,12 +60,16 @@ class CameraController:
         if force_restart and self.stream_active:
             self.stop_stream()
 
+        stream_url = rtsp_url or CAMERA_RTSP
+        ll_mode = STREAM_LOW_LATENCY if low_latency is None else low_latency
+
         self.video_stream = VideoStream(
-            rtsp_url=CAMERA_RTSP,
+            rtsp_url=stream_url,
             width=CAPTURE_WIDTH,
             height=CAPTURE_HEIGHT,
             buffer_size=3,
-            use_gpu=use_gpu
+            use_gpu=use_gpu,
+            low_latency=ll_mode,
         )
 
         if self.video_stream.start():
@@ -116,13 +130,13 @@ class CameraController:
             raise RuntimeError(f"截图失败: {result.stderr.decode()}")
         return output_path
     
-    def get_frame(self) -> Optional:
+    def get_frame(self) -> Optional[np.ndarray]:
         """获取当前帧"""
         if self.video_stream:
             return self.video_stream.get_frame()
         return None
 
-    def ptz_turn(self, direction: str, duration: float) -> bool:
+    def ptz_turn(self, direction: str, duration: float, speed: Optional[int] = None) -> bool:
         """云台转动（水平或垂直，阻塞式）"""
         direction_map = {
             "left": DIR_LEFT_CODE,
@@ -138,18 +152,18 @@ class CameraController:
         dir_code = direction_map[direction]
 
         try:
-            warning = self._ptz_control("start", dir_code)
+            warning = self._ptz_control("start", dir_code, speed=speed)
             if warning:
                 return False
 
             time.sleep(float(duration))
-            self._ptz_control("stop", dir_code)
+            self._ptz_control("stop", dir_code, speed=speed)
             return True
         except Exception as e:
             print(f"⚠️  PTZ转动异常: {e}")
             return False
 
-    def ptz_turn_async(self, direction: str):
+    def ptz_turn_async(self, direction: str, speed: Optional[int] = None):
         """异步启动云台转动（非阻塞）"""
         direction_map = {
             "left": DIR_LEFT_CODE,
@@ -163,15 +177,15 @@ class CameraController:
             return False, 0
 
         dir_code = direction_map[direction]
-        warning = self._ptz_control("start", dir_code)
+        warning = self._ptz_control("start", dir_code, speed=speed)
         if warning:
             return False, 0
 
         return True, dir_code
 
-    def ptz_stop(self, direction: int) -> None:
+    def ptz_stop(self, direction: int, speed: Optional[int] = None) -> None:
         """停止指定方向的转动"""
-        self._ptz_control("stop", direction)
+        self._ptz_control("stop", direction, speed=speed)
 
     def center_person(self, offset_x: float, offset_y: float = 0) -> bool:
         """将人物移到画面中央"""
@@ -219,15 +233,17 @@ class CameraController:
         
         return adjusted
 
-    def _ptz_control(self, action: str, direction: int) -> Optional[str]:
+    def _ptz_control(self, action: str, direction: int, speed: Optional[int] = None) -> Optional[str]:
         """调用萤石云 API"""
+        resolved_speed = self.ptz_speed_default if speed is None else int(speed)
+        resolved_speed = max(1, min(7, resolved_speed))
         with self._ptz_lock:
             data = urllib.parse.urlencode({
                 "accessToken": ACCESS_TOKEN,
                 "deviceSerial": DEVICE_SERIAL,
                 "channelNo": 1,
                 "direction": direction,
-                "speed": 1,
+                "speed": resolved_speed,
             })
 
             url = f"https://open.ys7.com/api/lapp/device/ptz/{action}"

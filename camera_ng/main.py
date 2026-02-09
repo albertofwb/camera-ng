@@ -18,9 +18,10 @@ faulthandler.enable()
 from camera_ng import (
     DEFAULT_NUM_STEPS, DEFAULT_TOTAL_ANGLE,
     ROTATION_SPEED, TRACK_CHECK_INTERVAL, DETECTION_INTERVAL,
+    PTZ_SPEED, PTZ_FAST_SPEED,
     TRACKER_MAX_AGE, TRACKER_MIN_HITS,
     CAPTURE_WIDTH, CAPTURE_HEIGHT, LOCK_FILE,
-    CAMERA_RTSP, DEVICE_SERIAL, ACCESS_TOKEN,
+    CAMERA_RTSP, CAMERA_RTSP_SUB, STREAM_LOW_LATENCY, DEVICE_SERIAL, ACCESS_TOKEN,
     CameraController, VisionAnalyzer, HandRaiseDetector, XiaoxiaoTTS, AsyncVoiceQueue,
     PersonTracker, TrackingMemory
 )
@@ -293,9 +294,13 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                          send_to_tg: bool = False,
                          enable_miss: bool = False,
                          voice_drop_oldest: bool = False,
-                         mute_voice: bool = False) -> None:
+                         mute_voice: bool = False,
+                         low_latency_stream: bool = STREAM_LOW_LATENCY,
+                         ptz_speed: int = PTZ_SPEED,
+                         ptz_speed_fast: int = PTZ_FAST_SPEED) -> None:
     """实时目标跟踪模式 - 使用重构后的处理器"""
     cam = SmartCamera()
+    cam.camera.ptz_speed_default = int(max(1, min(7, ptz_speed)))
     effective_detection_interval = 1 if quick_mode else detection_interval
     tracker = PersonTracker(
         yolo_model="yolov8n",
@@ -329,6 +334,12 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     STABLE_HOLD_SEC = 0.45
     STABLE_VEL_THRESHOLD = 0.03
     CALIB_DONE_MIN_INTERVAL_SEC = 2.0
+    MICRO_STEP_MAX_SEC = 0.09
+    MICRO_STEP_MIN_SEC = 0.02
+    MICRO_STEP_Y_THRESHOLD = 0.22
+    FAST_TARGET_VEL_X = 0.06
+    FAST_TURN_BOOST = 1.6
+    FAST_TURN_MAX_SEC = 0.12
 
     calibrating_active = False
     stable_candidate_since = 0.0
@@ -346,6 +357,28 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         status_voice_last_ts[text] = now
         if voice_queue is not None:
             voice_queue.enqueue(text)
+
+    def apply_micro_recenter(offset_x: float, offset_y: float, speed_x: float = 0.0) -> bool:
+        moved = False
+        abs_x = abs(offset_x)
+        fast_move = speed_x >= FAST_TARGET_VEL_X and abs_x >= 0.10
+        cmd_speed = int(max(1, min(7, ptz_speed_fast if fast_move else ptz_speed)))
+        if abs_x >= 0.06:
+            step_x = min(MICRO_STEP_MAX_SEC, max(MICRO_STEP_MIN_SEC, abs_x * 0.06))
+            if fast_move:
+                step_x = min(FAST_TURN_MAX_SEC, step_x * FAST_TURN_BOOST)
+            direction_x = "left" if offset_x < 0 else "right"
+            if cam.camera.ptz_turn(direction_x, step_x, speed=cmd_speed):
+                moved = True
+
+        abs_y = abs(offset_y)
+        if abs_y >= MICRO_STEP_Y_THRESHOLD:
+            step_y = min(0.06, max(0.02, abs_y * 0.04))
+            direction_y = "up" if offset_y < 0 else "down"
+            if cam.camera.ptz_turn(direction_y, step_y, speed=cmd_speed):
+                moved = True
+
+        return moved
 
     # Smart-Shot 组件
     tts = XiaoxiaoTTS() if not mute_voice else None
@@ -408,6 +441,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     print(f"YOLO检测间隔: 每{effective_detection_interval}帧")
     print(f"跟踪器: SORT (max_age={TRACKER_MAX_AGE}, min_hits={TRACKER_MIN_HITS})")
     print(f"视频解码: {'GPU (CUDA)' if use_gpu else 'CPU'}")
+    print(f"🎛️ PTZ速度: 常规{int(max(1, min(7, ptz_speed)))} / 追赶{int(max(1, min(7, ptz_speed_fast)))}")
+    print(f"📺 跟踪流: {'子码流' if CAMERA_RTSP_SUB else '主码流'} | {'低延迟' if low_latency_stream else '常规延迟'}")
     if smart_shot:
         print("📸 Smart-Shot: 右手异步保存高质量抓拍，左手抬起开始/停止录像")
         print("🖼️ 抓拍目录: ~/Desktop/capture/pictures")
@@ -430,7 +465,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     print("按 Ctrl+C 停止追踪")
     print("=" * 60 + "\n")
 
-    if not cam.camera.start_stream(use_gpu=use_gpu):
+    tracking_rtsp = CAMERA_RTSP_SUB or CAMERA_RTSP
+    if not cam.camera.start_stream(use_gpu=use_gpu, rtsp_url=tracking_rtsp, low_latency=low_latency_stream):
         print("❌ 无法启动视频流")
         return
 
@@ -457,7 +493,11 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     cam.camera.tracking_memory.reset()
 
                     if not cam.camera.stream_active:
-                        if not cam.camera.start_stream():
+                        if not cam.camera.start_stream(
+                            use_gpu=use_gpu,
+                            rtsp_url=tracking_rtsp,
+                            low_latency=low_latency_stream,
+                        ):
                             return
                         time.sleep(0.5)
 
@@ -501,8 +541,16 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                         recording_mgr.on_person_found()
                 else:
                     print("未找到，继续扫描...")
-                    if not cam.camera.start_stream():
-                        cam.camera.start_stream()
+                    if not cam.camera.start_stream(
+                        use_gpu=use_gpu,
+                        rtsp_url=tracking_rtsp,
+                        low_latency=low_latency_stream,
+                    ):
+                        cam.camera.start_stream(
+                            use_gpu=use_gpu,
+                            rtsp_url=tracking_rtsp,
+                            low_latency=low_latency_stream,
+                        )
                     time.sleep(0.5)
 
             elif analyzing:
@@ -556,13 +604,14 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                             broadcast_status("校准中", min_interval_sec=0.5)
                         calibrating_active = True
                         stable_candidate_since = 0.0
-                        print(f"\n   🎯 持续偏移触发居中: 水平{smoothed_offset_x:+.2f}, 垂直{smoothed_offset_y:+.2f}")
-                        cam.camera.center_person(smoothed_offset_x, smoothed_offset_y)
+                        speed_x = 0.0
+                        if len(offset_x_history) >= 2:
+                            speed_x = abs(offset_x_history[-1] - offset_x_history[-2])
+                        print(f"\n   🎯 持续偏移触发微步跟随: 水平{smoothed_offset_x:+.2f}, 垂直{smoothed_offset_y:+.2f}")
+                        apply_micro_recenter(smoothed_offset_x, smoothed_offset_y, speed_x)
                         recenter_candidate_count = 0
                         last_recenter_time = current_time
-                        offset_x_history.clear()
-                        offset_y_history.clear()
-                        time.sleep(recenter_pause)
+                        time.sleep(frame_sleep)
 
                     # 校准完成判定：进入中心死区并持续稳定一段时间
                     if calibrating_active:
@@ -701,6 +750,10 @@ def show_help():
     print("  --tg, --telegram            - 开启 Telegram 发送（默认关闭）")
     print("  --enable-miss              - 开启“目标丢失”语音播报")
     print("  --voice-drop-oldest         - 语音队列满时丢弃最旧播报")
+    print("  --low-latency               - 跟踪流启用低延迟拉流参数")
+    print("  --normal-latency            - 跟踪流使用常规拉流参数")
+    print("  --ptz-speed <1-7>           - 云台常规速度档位")
+    print("  --ptz-speed-fast <1-7>      - 云台追赶速度档位")
     print("  -m, --mute                  - 不入队任何本机语音播报")
     print("  --overwrite                 - 仅用于 prepare-tts，覆盖已有音频")
     print("  --speed <度/秒>             - 指定转速")
@@ -709,6 +762,8 @@ def show_help():
     print("  python3 -m camera_ng track -g       # GPU 实时跟踪")
     print("  python3 -m camera_ng smart-shot -g -quick  # 高灵敏手势抓拍")
     print("  python3 -m camera_ng smart-shot -g --tg     # 开启 Telegram 发送")
+    print("  python3 -m camera_ng track -g --low-latency # 低延迟跟踪")
+    print("  python3 -m camera_ng track --ptz-speed 2 --ptz-speed-fast 5")
     print("  python3 -m camera_ng shot 8 180 --tg         # 拍照并发送")
     print("  python3 -m camera_ng prepare-tts             # 预生成本地提示音")
     print("\nSmart-Shot 行为:")
@@ -772,6 +827,28 @@ def main():
         mute_voice = True
         args = [a for a in args if a not in ["-m", "--mute"]]
 
+    low_latency_stream = STREAM_LOW_LATENCY
+    if "--low-latency" in args:
+        low_latency_stream = True
+        args = [a for a in args if a != "--low-latency"]
+    if "--normal-latency" in args:
+        low_latency_stream = False
+        args = [a for a in args if a != "--normal-latency"]
+
+    ptz_speed = PTZ_SPEED
+    if "--ptz-speed" in args:
+        idx = args.index("--ptz-speed")
+        if idx + 1 < len(args):
+            ptz_speed = max(1, min(7, int(args[idx + 1])))
+            args = args[:idx] + args[idx + 2:]
+
+    ptz_speed_fast = PTZ_FAST_SPEED
+    if "--ptz-speed-fast" in args:
+        idx = args.index("--ptz-speed-fast")
+        if idx + 1 < len(args):
+            ptz_speed_fast = max(1, min(7, int(args[idx + 1])))
+            args = args[:idx] + args[idx + 2:]
+
     # 解析转速选项
     global ROTATION_SPEED
     if "--speed" in args:
@@ -826,6 +903,9 @@ def main():
                 enable_miss=enable_miss,
                 voice_drop_oldest=voice_drop_oldest,
                 mute_voice=mute_voice,
+                low_latency_stream=low_latency_stream,
+                ptz_speed=ptz_speed,
+                ptz_speed_fast=ptz_speed_fast,
             )
 
         elif cmd == "smart-shot":
@@ -839,6 +919,9 @@ def main():
                 enable_miss=enable_miss,
                 voice_drop_oldest=voice_drop_oldest,
                 mute_voice=mute_voice,
+                low_latency_stream=low_latency_stream,
+                ptz_speed=ptz_speed,
+                ptz_speed_fast=ptz_speed_fast,
             )
 
         elif cmd == "prepare-tts":

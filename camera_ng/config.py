@@ -65,6 +65,7 @@ LOCK_FILE = "/tmp/mooer_camera.lock"
 
 # 摄像头配置（敏感信息必须从 YAML 配置读取，无默认值）
 CAMERA_RTSP = get_config('camera.rtsp_url', None)  # 必须从配置读取
+CAMERA_RTSP_SUB = get_config('camera.rtsp_sub_url', None)
 CAPTURE_SEEK_TIME = get_config('camera.capture.seek_time', "00:00:00.5")
 DEVICE_SERIAL = get_config('camera.device_serial', None)  # 必须从配置读取
 ACCESS_TOKEN = get_config('camera.access_token', None)  # 必须从配置读取
@@ -89,6 +90,8 @@ YOLO_CONFIDENCE = get_config('detection.confidence_threshold', 0.5)
 
 # 云台配置
 ROTATION_SPEED = get_config('camera.ptz.rotation_speed', 28)
+PTZ_SPEED = get_config('camera.ptz.speed', 1)
+PTZ_FAST_SPEED = get_config('camera.ptz.speed_fast', 3)
 LEFT_LIMIT_STEP_DURATION = get_config('camera.ptz.left_limit_step_duration', 0.5)
 TURN_STABILIZE_TIME = get_config('camera.ptz.turn_stabilize_time', 0.5)
 
@@ -100,6 +103,7 @@ MAX_CENTER_ADJUST = get_config('detection.track.max_center_adjust', 30)
 # 视频流配置
 STREAM_FPS = get_config('stream.fps', 30)
 STREAM_BUFFER_SIZE = get_config('stream.buffer_size', 3)
+STREAM_LOW_LATENCY = get_config('stream.low_latency', False)
 
 # 目标跟踪配置
 TRACKER_MAX_AGE = get_config('tracker.max_age', 5)

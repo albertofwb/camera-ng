@@ -295,7 +295,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                          use_gpu: bool = False,
                          smart_shot: bool = False,
                          quick_mode: bool = False,
-                         send_to_tg: bool = False) -> None:
+                         send_to_tg: bool = False,
+                         enable_miss: bool = False) -> None:
     """实时目标跟踪模式 - 使用重构后的处理器"""
     cam = SmartCamera()
     effective_detection_interval = 1 if quick_mode else detection_interval
@@ -327,8 +328,21 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     BASE_RECENTER_Y_THRESHOLD = 0.6
     POST_FOUND_SETTLE_SEC = 0.3
 
+    status_voice_last_ts: dict[str, float] = {}
+
+    def broadcast_status(text: str, min_interval_sec: float = 0.0) -> None:
+        if tts is None or not tts.is_available():
+            return
+        now = time.time()
+        last_ts = status_voice_last_ts.get(text, 0.0)
+        if min_interval_sec > 0 and (now - last_ts) < min_interval_sec:
+            return
+        status_voice_last_ts[text] = now
+        if tts.playback(text):
+            print(f"🔈 已播报: {text}")
+
     # Smart-Shot 组件
-    tts = XiaoxiaoTTS() if smart_shot else None
+    tts = XiaoxiaoTTS()
     hand_detector = HandRaiseDetector() if smart_shot else None
     gesture_handler = (
         HandGestureHandler(
@@ -393,6 +407,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         print("📬 Smart-Shot 队列策略: drop_oldest（队列满时丢弃最旧任务）")
         print(f"🙋 手势检测频率: 每 {0.12 if quick_mode else 0.25:.2f}s 一次（降低跟踪卡顿）")
         print("🎬 录像策略: 仅左手抬起开始，丢失目标时自动停止")
+    print(f"🔔 目标丢失播报: {'开启' if enable_miss else '关闭（使用 --enable-miss 开启）'}")
     if quick_mode:
         print("⚡ Quick 模式: 高频检测 + 更低冷静时间")
     print("按 Ctrl+C 停止追踪")
@@ -421,6 +436,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
                 if person_found:
                     print("✅ 找到目标！")
+                    broadcast_status("目标捕获", min_interval_sec=0.8)
                     cam.camera.tracking_memory.reset()
 
                     if not cam.camera.stream_active:
@@ -511,8 +527,10 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                         and (current_time - last_recenter_time) >= RECENTER_COOLDOWN
                         and current_time >= post_found_settle_until
                     ):
+                        broadcast_status("校准中", min_interval_sec=0.5)
                         print(f"\n   🎯 持续偏移触发居中: 水平{smoothed_offset_x:+.2f}, 垂直{smoothed_offset_y:+.2f}")
                         cam.camera.center_person(smoothed_offset_x, smoothed_offset_y)
+                        broadcast_status("校准完成", min_interval_sec=0.5)
                         recenter_candidate_count = 0
                         last_recenter_time = current_time
                         offset_x_history.clear()
@@ -569,6 +587,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
                     if lost_count >= LOST_THRESHOLD:
                         print(f"\n   ⚠️ 丢失目标，重新扫描...")
+                        if enable_miss:
+                            broadcast_status("目标丢失", min_interval_sec=1.5)
                         if gesture_handler:
                             gesture_handler.reset()
                         if recording_mgr:
@@ -588,6 +608,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     else:
                         lost_count += 1
                         if lost_count >= LOST_THRESHOLD:
+                            if enable_miss:
+                                broadcast_status("目标丢失", min_interval_sec=1.5)
                             if recording_mgr:
                                 recording_mgr.on_person_lost()
                             person_found = False
@@ -624,6 +646,7 @@ def show_help():
     print("  -g, --gpu                   - 使用 GPU 硬解")
     print("  -quick, --quick             - 高性能模式（更灵敏，更耗电）")
     print("  --tg, --telegram            - 开启 Telegram 发送（默认关闭）")
+    print("  --enable-miss              - 开启“目标丢失”语音播报")
     print("  --overwrite                 - 仅用于 prepare-tts，覆盖已有音频")
     print("  --speed <度/秒>             - 指定转速")
     print("\n示例:")
@@ -636,6 +659,8 @@ def show_help():
     print("\nSmart-Shot 行为:")
     print("  - 右手抬起：异步保存高质量照片到 ~/Desktop/capture/pictures/<timestamp>.jpg")
     print("  - 左手抬起：开始/停止录像")
+    print("  - 目标捕获/校准中/校准完成：默认播报")
+    print("  - 目标丢失：仅 --enable-miss 时播报")
     print("  - Telegram 默认关闭；加 --tg 才发送")
 
 
@@ -674,6 +699,11 @@ def main():
     if "--overwrite" in args:
         overwrite_tts = True
         args = [a for a in args if a != "--overwrite"]
+
+    enable_miss = False
+    if "--enable-miss" in args:
+        enable_miss = True
+        args = [a for a in args if a != "--enable-miss"]
 
     # 解析转速选项
     global ROTATION_SPEED
@@ -726,6 +756,7 @@ def main():
                 use_gpu=use_gpu,
                 quick_mode=quick_mode,
                 send_to_tg=send_to_tg,
+                enable_miss=enable_miss,
             )
 
         elif cmd == "smart-shot":
@@ -736,6 +767,7 @@ def main():
                 smart_shot=True,
                 quick_mode=quick_mode,
                 send_to_tg=send_to_tg,
+                enable_miss=enable_miss,
             )
 
         elif cmd == "prepare-tts":

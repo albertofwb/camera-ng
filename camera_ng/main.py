@@ -292,7 +292,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                          quick_mode: bool = False,
                          send_to_tg: bool = False,
                          enable_miss: bool = False,
-                         voice_drop_oldest: bool = False) -> None:
+                         voice_drop_oldest: bool = False,
+                         mute_voice: bool = False) -> None:
     """实时目标跟踪模式 - 使用重构后的处理器"""
     cam = SmartCamera()
     effective_detection_interval = 1 if quick_mode else detection_interval
@@ -323,21 +324,35 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     BASE_RECENTER_Y_THRESHOLD = 0.6
     POST_FOUND_REVERSE_STEP_SEC = 0.15
     POST_FOUND_REVERSE_MIN_OFFSET = 0.08
+    STABLE_X_DEADBAND = 0.12
+    STABLE_Y_DEADBAND = 0.16
+    STABLE_HOLD_SEC = 0.45
+    STABLE_VEL_THRESHOLD = 0.03
+    CALIB_DONE_MIN_INTERVAL_SEC = 2.0
+
+    calibrating_active = False
+    stable_candidate_since = 0.0
+    last_calibration_done_time = 0.0
 
     status_voice_last_ts: dict[str, float] = {}
 
     def broadcast_status(text: str, min_interval_sec: float = 0.0) -> None:
+        if mute_voice:
+            return
         now = time.time()
         last_ts = status_voice_last_ts.get(text, 0.0)
         if min_interval_sec > 0 and (now - last_ts) < min_interval_sec:
             return
         status_voice_last_ts[text] = now
-        voice_queue.enqueue(text)
+        if voice_queue is not None:
+            voice_queue.enqueue(text)
 
     # Smart-Shot 组件
-    tts = XiaoxiaoTTS()
-    voice_queue = AsyncVoiceQueue(tts=tts, max_queue_size=8, drop_oldest=voice_drop_oldest)
-    voice_queue.start()
+    tts = XiaoxiaoTTS() if not mute_voice else None
+    voice_queue = None
+    if tts is not None:
+        voice_queue = AsyncVoiceQueue(tts=tts, max_queue_size=8, drop_oldest=voice_drop_oldest)
+        voice_queue.start()
     hand_detector = HandRaiseDetector(infer_imgsz=224 if quick_mode else 256) if smart_shot else None
     gesture_handler = (
         HandGestureHandler(
@@ -354,7 +369,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         RecordingManager(
             rtsp_url=CAMERA_RTSP,
             tts=tts,
-            voice_enqueue=voice_queue.enqueue,
+            voice_enqueue=(voice_queue.enqueue if voice_queue is not None else None),
             toggle_cooldown_sec=1.5,
             auto_start_on_person_found=False,
         )
@@ -373,7 +388,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
             camera=cam.camera,
             tts=tts,
             telegram_target=TELEGRAM_TARGET,
-            voice_enqueue=voice_queue.enqueue,
+            voice_enqueue=(voice_queue.enqueue if voice_queue is not None else None),
             max_queue_size=3,
             task_callback=smart_shot_task_callback,
         )
@@ -406,7 +421,10 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         print(f"🙋 手势模型输入: {224 if quick_mode else 256}px")
         print("🎬 录像策略: 仅左手抬起开始，丢失目标时自动停止")
     print(f"🔔 目标丢失播报: {'开启' if enable_miss else '关闭（使用 --enable-miss 开启）'}")
-    print(f"🔊 语音队列: {'drop_oldest' if voice_drop_oldest else 'keep_all'}")
+    if mute_voice:
+        print("🔇 本机语音播报: 关闭（-m/--mute）")
+    else:
+        print(f"🔊 语音队列: {'drop_oldest' if voice_drop_oldest else 'keep_all'}")
     if quick_mode:
         print("⚡ Quick 模式: 高频检测 + 更低冷静时间")
     print("按 Ctrl+C 停止追踪")
@@ -463,6 +481,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
                     analyzing = True
                     lost_count = 0
+                    calibrating_active = False
+                    stable_candidate_since = 0.0
 
                     # 找到目标后，按人物偏移做一次反方向微调（替代固定等待）
                     init_main = tracker.get_main_person()
@@ -532,15 +552,44 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                         recenter_candidate_count >= RECENTER_CONFIRM_FRAMES
                         and (current_time - last_recenter_time) >= RECENTER_COOLDOWN
                     ):
-                        broadcast_status("校准中", min_interval_sec=0.5)
+                        if not calibrating_active:
+                            broadcast_status("校准中", min_interval_sec=0.5)
+                        calibrating_active = True
+                        stable_candidate_since = 0.0
                         print(f"\n   🎯 持续偏移触发居中: 水平{smoothed_offset_x:+.2f}, 垂直{smoothed_offset_y:+.2f}")
                         cam.camera.center_person(smoothed_offset_x, smoothed_offset_y)
-                        broadcast_status("校准完成", min_interval_sec=0.5)
                         recenter_candidate_count = 0
                         last_recenter_time = current_time
                         offset_x_history.clear()
                         offset_y_history.clear()
                         time.sleep(recenter_pause)
+
+                    # 校准完成判定：进入中心死区并持续稳定一段时间
+                    if calibrating_active:
+                        in_deadband = (
+                            abs(smoothed_offset_x) <= STABLE_X_DEADBAND
+                            and abs(smoothed_offset_y) <= STABLE_Y_DEADBAND
+                        )
+                        if len(offset_x_history) >= 2 and len(offset_y_history) >= 2:
+                            vel_x = abs(offset_x_history[-1] - offset_x_history[-2])
+                            vel_y = abs(offset_y_history[-1] - offset_y_history[-2])
+                            low_motion = vel_x <= STABLE_VEL_THRESHOLD and vel_y <= STABLE_VEL_THRESHOLD
+                        else:
+                            low_motion = False
+
+                        if in_deadband and low_motion:
+                            if stable_candidate_since <= 0:
+                                stable_candidate_since = current_time
+                            elif (
+                                (current_time - stable_candidate_since) >= STABLE_HOLD_SEC
+                                and (current_time - last_calibration_done_time) >= CALIB_DONE_MIN_INTERVAL_SEC
+                            ):
+                                broadcast_status("校准完成", min_interval_sec=0.5)
+                                last_calibration_done_time = current_time
+                                calibrating_active = False
+                                stable_candidate_since = 0.0
+                        else:
+                            stable_candidate_since = 0.0
 
                     # 手势检测
                     if gesture_handler and smart_shot_worker:
@@ -582,6 +631,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     recenter_candidate_count = 0
                     offset_x_history.clear()
                     offset_y_history.clear()
+                    calibrating_active = False
+                    stable_candidate_since = 0.0
 
                     lost_count += 1
 
@@ -618,7 +669,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     except KeyboardInterrupt:
         print("\n\n停止追踪...")
     finally:
-        voice_queue.stop()
+        if voice_queue is not None:
+            voice_queue.stop()
         if recording_mgr:
             recording_mgr.cleanup()
         if smart_shot_worker:
@@ -649,6 +701,7 @@ def show_help():
     print("  --tg, --telegram            - 开启 Telegram 发送（默认关闭）")
     print("  --enable-miss              - 开启“目标丢失”语音播报")
     print("  --voice-drop-oldest         - 语音队列满时丢弃最旧播报")
+    print("  -m, --mute                  - 不入队任何本机语音播报")
     print("  --overwrite                 - 仅用于 prepare-tts，覆盖已有音频")
     print("  --speed <度/秒>             - 指定转速")
     print("\n示例:")
@@ -664,6 +717,7 @@ def show_help():
     print("  - 目标捕获/校准中/校准完成：默认播报")
     print("  - 目标丢失：仅 --enable-miss 时播报")
     print("  - 语音播报统一异步队列；可用 --voice-drop-oldest 避免积压")
+    print("  - 使用 -m/--mute 可禁用全部本机语音入队")
     print("  - Telegram 默认关闭；加 --tg 才发送")
 
 
@@ -712,6 +766,11 @@ def main():
     if "--voice-drop-oldest" in args:
         voice_drop_oldest = True
         args = [a for a in args if a != "--voice-drop-oldest"]
+
+    mute_voice = False
+    if "-m" in args or "--mute" in args:
+        mute_voice = True
+        args = [a for a in args if a not in ["-m", "--mute"]]
 
     # 解析转速选项
     global ROTATION_SPEED
@@ -766,6 +825,7 @@ def main():
                 send_to_tg=send_to_tg,
                 enable_miss=enable_miss,
                 voice_drop_oldest=voice_drop_oldest,
+                mute_voice=mute_voice,
             )
 
         elif cmd == "smart-shot":
@@ -778,6 +838,7 @@ def main():
                 send_to_tg=send_to_tg,
                 enable_miss=enable_miss,
                 voice_drop_oldest=voice_drop_oldest,
+                mute_voice=mute_voice,
             )
 
         elif cmd == "prepare-tts":

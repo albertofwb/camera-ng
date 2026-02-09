@@ -26,10 +26,23 @@ source .venv/bin/activate
 python3 -m camera_ng track -g
 ```
 
-#### 🙋 Smart-Shot（右手抬起抓拍）
-基于 track 实时模式，检测到抬手后自动抓拍并发送；右手抬起时额外发送中文语音问候：
+#### 🙋 Smart-Shot（手势联动）
+基于 track 实时模式，支持抬手触发不同动作（全程保持追踪）：
+- **右手抬起**：高质量抓拍并发送 Telegram；本机先播报「收到」，随后后台发送问候语音。
+- **左手抬起**：开始/停止高质量录像；录像文件自动保存到 `~/Desktop/capture/<timestamp>.mp4`。
+
 ```bash
 python3 -m camera_ng smart-shot -g
+```
+
+高灵敏模式（更快响应，更耗电）：
+```bash
+python3 -m camera_ng smart-shot -g -quick
+```
+
+追踪模式同样支持 `-quick`：
+```bash
+python3 -m camera_ng track -g -quick
 ```
 
 #### 📸 智能居中抓拍

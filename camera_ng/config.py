@@ -111,6 +111,10 @@ TRACKER_MIN_HITS = get_config('tracker.min_hits', 3)
 DETECTION_INTERVAL = get_config('tracker.detection_interval', 3)
 IOU_THRESHOLD = get_config('tracker.iou_threshold', 0.3)
 
+# 手势配置
+# auto: 自动判断画面是否镜像并动态纠偏；normal: 不交换左右；swapped: 固定交换左右
+HAND_SIDE_MODE = str(get_config('gesture.hand_side_mode', 'auto')).lower()
+
 # 时间配置（秒）
 DETECTION_SLEEP_TIME = 0.3
 TRACK_SCAN_DELAY = 0.5

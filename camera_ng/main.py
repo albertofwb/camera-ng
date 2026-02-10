@@ -22,6 +22,7 @@ from camera_ng import (
     TRACKER_MAX_AGE, TRACKER_MIN_HITS,
     CAPTURE_WIDTH, CAPTURE_HEIGHT, LOCK_FILE,
     CAMERA_RTSP, CAMERA_RTSP_SUB, STREAM_LOW_LATENCY, DEVICE_SERIAL, ACCESS_TOKEN,
+    HAND_SIDE_MODE,
     CameraController, VisionAnalyzer, HandRaiseDetector, XiaoxiaoTTS, AsyncVoiceQueue,
     PersonTracker, TrackingMemory
 )
@@ -261,6 +262,7 @@ def handle_gesture_event(
 
     if event.gesture == HandGesture.LEFT_HAND:
         # 左手控制录像开关
+        print(f"\n   ✋ 检测到左手抬起，切换录像状态... ({event.reason})")
         if recording_mgr is not None:
             recording_mgr.toggle(current_time)
             return True
@@ -268,7 +270,7 @@ def handle_gesture_event(
 
     elif event.gesture == HandGesture.RIGHT_HAND:
         # 右手触发 Smart-Shot
-        print("\n   🙋 检测到右手抬起，触发 Smart-Shot...")
+        print(f"\n   🙋 检测到右手抬起，触发 Smart-Shot... ({event.reason})")
         return smart_shot_worker.submit("右手", event.reason)
 
     return False
@@ -289,6 +291,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                          total_angle: float = 360,
                          detection_interval: int = DETECTION_INTERVAL,
                          use_gpu: bool = False,
+                         tracking_mode: str = "hybrid",
                          smart_shot: bool = False,
                          quick_mode: bool = False,
                          send_to_tg: bool = False,
@@ -310,6 +313,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
     # 状态管理
     cycle_count = 0
+    tracking_mode = (tracking_mode or "hybrid").lower()
+    software_assist_active = tracking_mode == "software"
     person_found = False
     analyzing = False
     lost_count = 0
@@ -317,16 +322,18 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
     fps_history = deque(maxlen=30)
     last_time = time.time()
-    offset_x_history = deque(maxlen=5)
-    offset_y_history = deque(maxlen=5)
+    offset_history_size = 3 if smart_shot else 5
+    offset_x_history = deque(maxlen=offset_history_size)
+    offset_y_history = deque(maxlen=offset_history_size)
     recenter_candidate_count = 0
     last_recenter_time = 0.0
 
     # 云台控制参数
     RECENTER_CONFIRM_FRAMES = 3
-    RECENTER_COOLDOWN = 1.2
+    RECENTER_COOLDOWN = 1.4 if smart_shot else 1.2
     BASE_RECENTER_X_THRESHOLD = 0.5
-    BASE_RECENTER_Y_THRESHOLD = 0.6
+    BASE_RECENTER_Y_THRESHOLD_UP = 0.28
+    BASE_RECENTER_Y_THRESHOLD_DOWN = 0.32
     POST_FOUND_REVERSE_STEP_SEC = 0.15
     POST_FOUND_REVERSE_MIN_OFFSET = 0.08
     STABLE_X_DEADBAND = 0.12
@@ -336,10 +343,20 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     CALIB_DONE_MIN_INTERVAL_SEC = 2.0
     MICRO_STEP_MAX_SEC = 0.09
     MICRO_STEP_MIN_SEC = 0.02
-    MICRO_STEP_Y_THRESHOLD = 0.22
+    MICRO_STEP_Y_THRESHOLD_UP = 0.10
+    MICRO_STEP_Y_THRESHOLD_DOWN = 0.12
     FAST_TARGET_VEL_X = 0.06
-    FAST_TURN_BOOST = 1.6
-    FAST_TURN_MAX_SEC = 0.12
+    FAST_TURN_BOOST = 1.25 if smart_shot else 1.6
+    FAST_TURN_MAX_SEC = 0.09 if smart_shot else 0.12
+    # 垂直云台可用范围较小（约 20°），Smart-Shot 垂直纠偏要更保守
+    SMART_SHOT_FOOT_MARGIN_MIN = 0.05
+    SMART_SHOT_HEAD_MARGIN_MIN = 0.08
+    SMART_SHOT_MARGIN_GAIN = 1.8
+    SMART_SHOT_MARGIN_PUSH_MAX = 0.20
+    SMART_SHOT_FULL_BODY_HEIGHT_MAX = 0.78
+    SMART_SHOT_HEAD_LOW_TRIGGER = 0.58
+    SMART_SHOT_HEAD_LOW_PUSH_GAIN = 1.2
+    SMART_SHOT_HEAD_LOW_PUSH_MAX = 0.22
 
     calibrating_active = False
     stable_candidate_since = 0.0
@@ -372,8 +389,10 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                 moved = True
 
         abs_y = abs(offset_y)
-        if abs_y >= MICRO_STEP_Y_THRESHOLD:
-            step_y = min(0.06, max(0.02, abs_y * 0.04))
+        y_threshold = MICRO_STEP_Y_THRESHOLD_UP if offset_y < 0 else MICRO_STEP_Y_THRESHOLD_DOWN
+        if abs_y >= y_threshold:
+            step_y_scale = 0.06 if offset_y < 0 else 0.04
+            step_y = min(0.06, max(0.02, abs_y * step_y_scale))
             direction_y = "up" if offset_y < 0 else "down"
             if cam.camera.ptz_turn(direction_y, step_y, speed=cmd_speed):
                 moved = True
@@ -386,7 +405,10 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     if tts is not None:
         voice_queue = AsyncVoiceQueue(tts=tts, max_queue_size=8, drop_oldest=voice_drop_oldest)
         voice_queue.start()
-    hand_detector = HandRaiseDetector(infer_imgsz=224 if quick_mode else 256) if smart_shot else None
+    hand_detector = HandRaiseDetector(
+        infer_imgsz=224 if quick_mode else 256,
+        hand_side_mode=HAND_SIDE_MODE,
+    ) if smart_shot else None
     gesture_handler = (
         HandGestureHandler(
             detector=hand_detector,
@@ -394,7 +416,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
             release_frames=2 if quick_mode else 3,
             cooldown_sec=0.6 if quick_mode else 1.0,
             log_interval_sec=0.5 if quick_mode else 1.0,
-            detect_interval_sec=0.20 if quick_mode else 0.40,
+            detect_interval_sec=0.25 if quick_mode else 0.55,
         )
         if smart_shot and hand_detector else None
     )
@@ -441,6 +463,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     print(f"YOLO检测间隔: 每{effective_detection_interval}帧")
     print(f"跟踪器: SORT (max_age={TRACKER_MAX_AGE}, min_hits={TRACKER_MIN_HITS})")
     print(f"视频解码: {'GPU (CUDA)' if use_gpu else 'CPU'}")
+    print(f"🎯 跟踪模式: {tracking_mode}{' (software-assist)' if software_assist_active else ''}")
     print(f"🎛️ PTZ速度: 常规{int(max(1, min(7, ptz_speed)))} / 追赶{int(max(1, min(7, ptz_speed_fast)))}")
     print(f"📺 跟踪流: {'子码流' if CAMERA_RTSP_SUB else '主码流'} | {'低延迟' if low_latency_stream else '常规延迟'}")
     if smart_shot:
@@ -454,6 +477,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         print("📬 Smart-Shot 队列策略: drop_oldest（队列满时丢弃最旧任务）")
         print(f"🙋 手势检测频率: 每 {0.20 if quick_mode else 0.40:.2f}s 一次（优先跟随流畅度）")
         print(f"🙋 手势模型输入: {224 if quick_mode else 256}px")
+        print(f"🙋 左右手模式: {HAND_SIDE_MODE}（auto/normal/swapped）")
         print("🎬 录像策略: 仅左手抬起开始，丢失目标时自动停止")
     print(f"🔔 目标丢失播报: {'开启' if enable_miss else '关闭（使用 --enable-miss 开启）'}")
     if mute_voice:
@@ -462,6 +486,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
         print(f"🔊 语音队列: {'drop_oldest' if voice_drop_oldest else 'keep_all'}")
     if quick_mode:
         print("⚡ Quick 模式: 高频检测 + 更低冷静时间")
+    if tracking_mode in ("native", "hybrid"):
+        print("ℹ️ native/hybrid 依赖摄像头端已开启人像追踪；失效时 hybrid 会自动切回软件扫描")
     print("按 Ctrl+C 停止追踪")
     print("=" * 60 + "\n")
 
@@ -480,6 +506,37 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
             last_time = current_time
 
             if not person_found:
+                if tracking_mode in ("native", "hybrid") and not software_assist_active:
+                    frame = cam.camera.get_frame()
+                    if frame is None:
+                        time.sleep(frame_sleep)
+                        continue
+
+                    tracks = tracker.update(frame)
+                    main_person = tracker.get_main_person()
+                    if main_person is not None and tracks:
+                        person_found = True
+                        analyzing = True
+                        lost_count = 0
+                        recenter_candidate_count = 0
+                        calibrating_active = False
+                        stable_candidate_since = 0.0
+                        print("✅ native 跟踪检测到目标")
+                        broadcast_status("目标捕获", min_interval_sec=0.8)
+                        cam.camera.tracking_memory.reset()
+                        if recording_mgr:
+                            recording_mgr.on_person_found()
+                        time.sleep(frame_sleep)
+                        continue
+
+                    lost_count += 1
+                    if tracking_mode == "hybrid" and lost_count >= LOST_THRESHOLD:
+                        print("⚠️ native 跟踪未稳定捕获，切换到软件扫描兜底...")
+                        software_assist_active = True
+                        lost_count = 0
+                    time.sleep(frame_sleep)
+                    continue
+
                 # 扫描找人
                 print(f"\n{'=' * 60}")
                 print(f"🔄 第 {cycle_count} 轮 | 执行智能扫描...")
@@ -489,6 +546,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
                 if person_found:
                     print("✅ 找到目标！")
+                    if software_assist_active:
+                        print("🧩 软件扫描兜底成功，回交 native 跟踪")
                     broadcast_status("目标捕获", min_interval_sec=0.8)
                     cam.camera.tracking_memory.reset()
 
@@ -521,12 +580,14 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
 
                     analyzing = True
                     lost_count = 0
+                    if tracking_mode == "hybrid":
+                        software_assist_active = False
                     calibrating_active = False
                     stable_candidate_since = 0.0
 
                     # 找到目标后，按人物偏移做一次反方向微调（替代固定等待）
                     init_main = tracker.get_main_person()
-                    if init_main is not None:
+                    if init_main is not None and (tracking_mode == "software" or software_assist_active):
                         init_cx = (init_main.bbox[0] + init_main.bbox[2]) / 2
                         init_offset_x = (init_cx - CAPTURE_WIDTH / 2) / (CAPTURE_WIDTH / 2)
                         if init_offset_x >= POST_FOUND_REVERSE_MIN_OFFSET:
@@ -574,6 +635,33 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     offset_y_history.append(offset_y)
                     smoothed_offset_x = sum(offset_x_history) / len(offset_x_history)
                     smoothed_offset_y = sum(offset_y_history) / len(offset_y_history)
+                    effective_offset_y = smoothed_offset_y
+
+                    if smart_shot:
+                        top_margin_ratio = max(0.0, float(main_person.bbox[1]) / CAPTURE_HEIGHT)
+                        bottom_margin_ratio = max(0.0, float(CAPTURE_HEIGHT - main_person.bbox[3]) / CAPTURE_HEIGHT)
+                        person_height_ratio = max(0.0, float(main_person.bbox[3] - main_person.bbox[1]) / CAPTURE_HEIGHT)
+
+                        # 人像过高通常受视角/FOV限制，继续压垂直云台收益有限且更容易打到上下限位
+                        can_push_for_foot = person_height_ratio <= SMART_SHOT_FULL_BODY_HEIGHT_MAX
+
+                        if can_push_for_foot and bottom_margin_ratio < SMART_SHOT_FOOT_MARGIN_MIN:
+                            push_down = (SMART_SHOT_FOOT_MARGIN_MIN - bottom_margin_ratio) * SMART_SHOT_MARGIN_GAIN
+                            push_down = min(SMART_SHOT_MARGIN_PUSH_MAX, push_down)
+                            effective_offset_y = max(effective_offset_y, push_down)
+
+                        if top_margin_ratio < SMART_SHOT_HEAD_MARGIN_MIN:
+                            push_up = (SMART_SHOT_HEAD_MARGIN_MIN - top_margin_ratio) * SMART_SHOT_MARGIN_GAIN
+                            push_up = min(SMART_SHOT_MARGIN_PUSH_MAX, push_up)
+                            effective_offset_y = min(effective_offset_y, -push_up)
+
+                        # 头部明显落在画面下半区时，优先触发向下修正（补偿“头在底部不跟随”）
+                        if top_margin_ratio > SMART_SHOT_HEAD_LOW_TRIGGER:
+                            head_low_push = (top_margin_ratio - SMART_SHOT_HEAD_LOW_TRIGGER) * SMART_SHOT_HEAD_LOW_PUSH_GAIN
+                            head_low_push = min(SMART_SHOT_HEAD_LOW_PUSH_MAX, head_low_push)
+                            effective_offset_y = max(effective_offset_y, head_low_push)
+
+                    ptz_control_active = (tracking_mode == "software") or software_assist_active
 
                     # 更新运动记忆
                     current_angle = cam.camera.tracking_memory.last_angle
@@ -586,9 +674,14 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                     # 居中逻辑
                     person_width_ratio = (main_person.bbox[2] - main_person.bbox[0]) / CAPTURE_WIDTH
                     dynamic_x_threshold = BASE_RECENTER_X_THRESHOLD + min(0.25, person_width_ratio * 0.35)
+                    dynamic_y_threshold = (
+                        BASE_RECENTER_Y_THRESHOLD_UP
+                        if effective_offset_y < 0
+                        else BASE_RECENTER_Y_THRESHOLD_DOWN
+                    )
                     need_recenter = (
                         abs(smoothed_offset_x) > dynamic_x_threshold
-                        or abs(smoothed_offset_y) > BASE_RECENTER_Y_THRESHOLD
+                        or abs(effective_offset_y) > dynamic_y_threshold
                     )
 
                     if need_recenter:
@@ -597,6 +690,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                         recenter_candidate_count = 0
 
                     if (
+                        ptz_control_active
+                        and
                         recenter_candidate_count >= RECENTER_CONFIRM_FRAMES
                         and (current_time - last_recenter_time) >= RECENTER_COOLDOWN
                     ):
@@ -607,14 +702,14 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                         speed_x = 0.0
                         if len(offset_x_history) >= 2:
                             speed_x = abs(offset_x_history[-1] - offset_x_history[-2])
-                        print(f"\n   🎯 持续偏移触发微步跟随: 水平{smoothed_offset_x:+.2f}, 垂直{smoothed_offset_y:+.2f}")
-                        apply_micro_recenter(smoothed_offset_x, smoothed_offset_y, speed_x)
+                        print(f"\n   🎯 持续偏移触发微步跟随: 水平{smoothed_offset_x:+.2f}, 垂直{effective_offset_y:+.2f}")
+                        apply_micro_recenter(smoothed_offset_x, effective_offset_y, speed_x)
                         recenter_candidate_count = 0
                         last_recenter_time = current_time
                         time.sleep(frame_sleep)
 
                     # 校准完成判定：进入中心死区并持续稳定一段时间
-                    if calibrating_active:
+                    if ptz_control_active and calibrating_active:
                         in_deadband = (
                             abs(smoothed_offset_x) <= STABLE_X_DEADBAND
                             and abs(smoothed_offset_y) <= STABLE_Y_DEADBAND
@@ -639,9 +734,19 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                                 stable_candidate_since = 0.0
                         else:
                             stable_candidate_since = 0.0
+                    elif not ptz_control_active:
+                        calibrating_active = False
+                        stable_candidate_since = 0.0
+                        recenter_candidate_count = 0
 
                     # 手势检测
                     if gesture_handler and smart_shot_worker:
+                        # 校准阶段暂缓手势检测，优先保证目标跟随实时性
+                        if calibrating_active or recenter_candidate_count > 0:
+                            lost_count = 0
+                            time.sleep(frame_sleep)
+                            continue
+
                         # 目标偏移较大时优先云台跟随，暂缓手势推理，避免拖慢跟踪
                         if abs(smoothed_offset_x) > 0.65 or abs(smoothed_offset_y) > 0.75:
                             lost_count = 0
@@ -693,6 +798,9 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                             gesture_handler.reset()
                         if recording_mgr:
                             recording_mgr.on_person_lost()
+                        if tracking_mode == "hybrid":
+                            software_assist_active = True
+                            print("   🧩 hybrid 已切换到软件扫描兜底")
                         analyzing = False
                         person_found = False
 
@@ -712,6 +820,8 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
                                 broadcast_status("目标丢失", min_interval_sec=1.5)
                             if recording_mgr:
                                 recording_mgr.on_person_lost()
+                            if tracking_mode == "hybrid":
+                                software_assist_active = True
                             person_found = False
                 time.sleep(TRACK_CHECK_INTERVAL)
 
@@ -754,6 +864,7 @@ def show_help():
     print("  --normal-latency            - 跟踪流使用常规拉流参数")
     print("  --ptz-speed <1-7>           - 云台常规速度档位")
     print("  --ptz-speed-fast <1-7>      - 云台追赶速度档位")
+    print("  --tracking-mode <mode>      - 跟踪模式: native|hybrid|software")
     print("  -m, --mute                  - 不入队任何本机语音播报")
     print("  --overwrite                 - 仅用于 prepare-tts，覆盖已有音频")
     print("  --speed <度/秒>             - 指定转速")
@@ -763,6 +874,8 @@ def show_help():
     print("  python3 -m camera_ng smart-shot -g -quick  # 高灵敏手势抓拍")
     print("  python3 -m camera_ng smart-shot -g --tg     # 开启 Telegram 发送")
     print("  python3 -m camera_ng track -g --low-latency # 低延迟跟踪")
+    print("  python3 -m camera_ng track --tracking-mode hybrid")
+    print("  python3 -m camera_ng smart-shot -g --tracking-mode native")
     print("  python3 -m camera_ng track --ptz-speed 2 --ptz-speed-fast 5")
     print("  python3 -m camera_ng shot 8 180 --tg         # 拍照并发送")
     print("  python3 -m camera_ng prepare-tts             # 预生成本地提示音")
@@ -849,6 +962,21 @@ def main():
             ptz_speed_fast = max(1, min(7, int(args[idx + 1])))
             args = args[:idx] + args[idx + 2:]
 
+    tracking_mode = "hybrid"
+    if "--tracking-mode" in args:
+        idx = args.index("--tracking-mode")
+        if idx + 1 < len(args):
+            tracking_mode = args[idx + 1].strip().lower()
+            args = args[:idx] + args[idx + 2:]
+        else:
+            print("❌ --tracking-mode 需要参数: native|hybrid|software")
+            sys.exit(1)
+
+    if tracking_mode not in {"native", "hybrid", "software"}:
+        print(f"❌ 无效 --tracking-mode: {tracking_mode}")
+        print("   可选值: native, hybrid, software")
+        sys.exit(1)
+
     # 解析转速选项
     global ROTATION_SPEED
     if "--speed" in args:
@@ -898,6 +1026,7 @@ def main():
                 num_steps=num_steps,
                 total_angle=total_angle,
                 use_gpu=use_gpu,
+                tracking_mode=tracking_mode,
                 quick_mode=quick_mode,
                 send_to_tg=send_to_tg,
                 enable_miss=enable_miss,
@@ -913,6 +1042,7 @@ def main():
                 num_steps=num_steps,
                 total_angle=total_angle,
                 use_gpu=use_gpu,
+                tracking_mode=tracking_mode,
                 smart_shot=True,
                 quick_mode=quick_mode,
                 send_to_tg=send_to_tg,

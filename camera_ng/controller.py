@@ -273,7 +273,7 @@ class CameraController:
                 print(f"❌ PTZ 异常: {e}")
                 return str(e)
 
-    def goto_left_limit(self, vision: "VisionAnalyzer" = None) -> bool:
+    def goto_left_limit(self, vision: Optional["VisionAnalyzer"] = None) -> bool:
         """转到左极限位置"""
         print("\n🎯 转到左极限...")
         print("-" * 50)
@@ -463,32 +463,47 @@ class CameraController:
 
     def _scan_with_fallback(self, vision: "VisionAnalyzer", priority_dir: str, start_angle: float) -> bool:
         """优先方向扫描，未找到则回退反向扫描"""
-        step_duration = 0.15
-        max_steps = 40
+        step_duration = 0.12
+        priority_steps = 30
+        fallback_steps = 45
+        settle_time = 0.05
 
-        print(f"\n🔍 优先向{priority_dir}扫描...")
+        def try_detect(scan_dir: str) -> bool:
+            try:
+                frame = self.get_frame()
+                if frame is not None and vision.check_person(frame=frame)[0]:
+                    print(f"\n✅ {scan_dir}向扫描发现人！")
+                    offset_x, offset_y = vision.get_person_offset(frame=frame)
+                    position = vision.analyze_position(offset_x=offset_x)
+                    print(f"   语音播报: 找到你了，{position}")
+                    self.center_person(offset_x, offset_y)
+                    return True
+            except Exception as e:
+                print(f"⚠️  检测异常: {e}")
+            return False
+
+        print(f"\n🔍 优先向{priority_dir}扫描 (记忆角度 {start_angle:.0f}°)...")
         print("-" * 40)
 
-        for i in range(max_steps):
+        for _ in range(priority_steps):
             success = self.ptz_turn(priority_dir, step_duration)
             if not success:
+                print(f"🚧 {priority_dir}方向到达限位")
                 break
+            time.sleep(settle_time)
+            if try_detect(priority_dir):
+                return True
 
-            if i % 2 == 0:
-                try:
-                    frame = self.get_frame()
-                    if frame is not None and vision.check_person(frame=frame)[0]:
-                        print(f"\n✅ {priority_dir}向扫描发现人！")
-                        offset_x, offset_y = vision.get_person_offset(frame=frame)
-                        position = vision.analyze_position(offset_x=offset_x)
-                        print(f"   语音播报: 找到你了，{position}")
-                        self.center_person(offset_x, offset_y)
-                        return True
-                except Exception as e:
-                    print(f"⚠️  检测异常: {e}")
-
-        # 未找到 -> 回退反向扫描
         opposite = "left" if priority_dir == "right" else "right"
         print(f"\n↩️ 优先方向未找到，回退向{opposite}扫描...")
-        
+
+        for _ in range(fallback_steps):
+            success = self.ptz_turn(opposite, step_duration)
+            if not success:
+                print(f"🚧 {opposite}方向到达限位")
+                break
+            time.sleep(settle_time)
+            if try_detect(opposite):
+                return True
+
         return False

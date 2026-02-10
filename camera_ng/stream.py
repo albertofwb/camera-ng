@@ -7,14 +7,16 @@ import os
 import threading
 import time
 from collections import deque
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 
 try:
-    import cv2
+    import cv2 as _cv2
+    cv2: Any = _cv2
     CV2_AVAILABLE = True
 except ImportError:
+    cv2 = None
     CV2_AVAILABLE = False
     print("❌ OpenCV not available")
 
@@ -37,7 +39,7 @@ class VideoStream:
         self.use_gpu = use_gpu
         self.low_latency = low_latency
 
-        self.cap = None
+        self.cap: Any = None
         self.gpu_mode = False
         self.frame_buffer = deque(maxlen=buffer_size)
         self.latest_frame = None
@@ -48,6 +50,8 @@ class VideoStream:
         self._thread = None
         self._lock = threading.Lock()
         self._last_frame_time = 0
+        self._cpu_hwaccel_in_use = False
+        self._cpu_hw_decoder: Optional[str] = None
 
     def start(self) -> bool:
         """启动视频流"""
@@ -62,8 +66,9 @@ class VideoStream:
         if self.use_gpu:
             try:
                 # 检查是否有 CUDA 支持
-                if hasattr(cv2, 'cudacodec'):
-                    self.cap = cv2.cudacodec.createVideoReader(self.rtsp_url)
+                cudacodec_mod = getattr(cv2, "cudacodec", None) if cv2 is not None else None
+                if cudacodec_mod is not None:
+                    self.cap = cudacodec_mod.createVideoReader(self.rtsp_url)
                     self.gpu_mode = True
                     print(f"✅ GPU 硬解已启用 (CUDA)")
                 else:
@@ -81,11 +86,16 @@ class VideoStream:
                 return False
 
             # CPU 模式：检查 VideoCapture 是否成功
-            if not self.cap.isOpened():
+            if self.cap is None or not self.cap.isOpened():
                 print(f"❌ 无法打开视频流: {self.rtsp_url}")
                 return False
 
+            if self._cpu_hwaccel_in_use:
+                decoder = self._cpu_hw_decoder or "unknown"
+                print(f"✅ FFmpeg CUDA 硬解已启用 (CAP_FFMPEG, decoder={decoder})")
+
             # 尝试设置缓冲区大小
+            assert cv2 is not None
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             # 读取第一帧确认
@@ -101,19 +111,25 @@ class VideoStream:
 
             # 调整大小
             if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                frame = cv2.resize(frame, (self.width, self.height))
+                if cv2 is not None:
+                    frame = cv2.resize(frame, (self.width, self.height))
             self.latest_frame = frame
         else:
             # GPU 模式：读取第一帧确认
             try:
-                ret, gpu_frame = self.cap.nextFrame()
+                next_frame = getattr(self.cap, "nextFrame", None)
+                if next_frame is None:
+                    print("❌ GPU 解码器不支持 nextFrame 接口")
+                    return False
+                ret, gpu_frame = next_frame()
                 if not ret:
                     print("❌ GPU 模式无法读取视频流第一帧")
                     return False
                 # 下载到 CPU
                 frame = gpu_frame.download()
                 if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                    frame = cv2.resize(frame, (self.width, self.height))
+                    if cv2 is not None:
+                        frame = cv2.resize(frame, (self.width, self.height))
                 self.latest_frame = frame
             except Exception as e:
                 print(f"❌ GPU 模式初始化失败: {e}")
@@ -124,13 +140,18 @@ class VideoStream:
         self._thread = threading.Thread(target=self._update, daemon=True)
         self._thread.start()
 
-        mode_str = "GPU" if self.gpu_mode else "CPU"
+        mode_str = "GPU" if self.gpu_mode else ("CPU+FFmpeg-CUDA" if self._cpu_hwaccel_in_use else "CPU")
         latency_str = "low-latency" if self.low_latency else "normal-latency"
         print(f"✅ VideoStream started ({mode_str}, {latency_str}): {self.width}x{self.height}")
         return True
 
-    def _build_ffmpeg_options(self, low_latency: bool) -> str:
+    def _build_ffmpeg_options(self, low_latency: bool, hw_decoder: Optional[str] = None) -> str:
         ffmpeg_opts = ["rtsp_transport;tcp"]
+        if hw_decoder:
+            ffmpeg_opts.extend([
+                "hwaccel;cuda",
+                "hwaccel_output_format;cuda",
+            ])
         if low_latency:
             # HEVC 在 CPU 软解下对过激进的低延迟参数很敏感，
             # 避免使用 nobuffer/reorder_queue_size=0 这类容易打断参考帧链的选项。
@@ -143,20 +164,33 @@ class VideoStream:
         return "|".join(ffmpeg_opts)
 
     def _open_cpu_capture_with_fallback(self) -> bool:
-        # 先按当前 low_latency 配置尝试，失败时自动回退常规模式
-        attempts = [self.low_latency]
-        if self.low_latency:
-            attempts.append(False)
+        # 优先尝试 FFmpeg CUDA 硬解（自动选择解码器），失败后回退 CPU 常规解码
+        attempts: list[tuple[bool, Optional[str]]] = []
+        if self.use_gpu:
+            attempts.append((self.low_latency, "cuda"))
+            if self.low_latency:
+                attempts.append((False, "cuda"))
 
-        for idx, low_latency in enumerate(attempts):
-            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = self._build_ffmpeg_options(low_latency)
+        attempts.append((self.low_latency, None))
+        if self.low_latency:
+            attempts.append((False, None))
+
+        for idx, (low_latency, hw_decoder) in enumerate(attempts):
+            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = self._build_ffmpeg_options(low_latency, hw_decoder)
+            if cv2 is None:
+                return False
             self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
             if self.cap is not None and self.cap.isOpened():
+                self._cpu_hwaccel_in_use = hw_decoder is not None
+                self._cpu_hw_decoder = hw_decoder
                 if idx > 0:
                     self.low_latency = low_latency
-                    print("⚠️ 低延迟拉流初始化失败，已自动回退常规拉流")
+                    if hw_decoder is None:
+                        print("⚠️ 低延迟/硬解拉流初始化失败，已自动回退常规拉流")
                 return True
 
+        self._cpu_hwaccel_in_use = False
+        self._cpu_hw_decoder = None
         return False
     
     def _update(self):
@@ -171,13 +205,18 @@ class VideoStream:
             # GPU 模式
             if self.gpu_mode:
                 try:
-                    ret, gpu_frame = self.cap.nextFrame()
+                    next_frame = getattr(self.cap, "nextFrame", None)
+                    if next_frame is None:
+                        time.sleep(0.01)
+                        continue
+                    ret, gpu_frame = next_frame()
                     if not ret:
                         continue
                     # 下载到 CPU 并调整大小
                     frame = gpu_frame.download()
                     if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                        frame = cv2.resize(frame, (self.width, self.height))
+                        if cv2 is not None:
+                            frame = cv2.resize(frame, (self.width, self.height))
                 except Exception as e:
                     print(f"⚠️ GPU 解码错误: {e}")
                     continue
@@ -193,7 +232,8 @@ class VideoStream:
 
                 # 调整大小
                 if frame.shape[1] != self.width or frame.shape[0] != self.height:
-                    frame = cv2.resize(frame, (self.width, self.height))
+                    if cv2 is not None:
+                        frame = cv2.resize(frame, (self.width, self.height))
 
             # 更新最新帧
             with self._lock:
@@ -230,6 +270,8 @@ class VideoStream:
                 self.cap.release()
             self.cap = None
         self.gpu_mode = False
+        self._cpu_hwaccel_in_use = False
+        self._cpu_hw_decoder = None
         print("✅ VideoStream stopped")
     
     def __enter__(self):

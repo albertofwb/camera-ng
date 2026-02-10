@@ -168,11 +168,22 @@ class HandRaiseDetector:
     RIGHT_SHOULDER_IDX = 6
     RIGHT_WRIST_IDX = 10
 
-    def __init__(self, model_name: str = "yolov8n-pose", infer_imgsz: int = 320):
+    def __init__(
+        self,
+        model_name: str = "yolov8n-pose",
+        infer_imgsz: int = 320,
+        hand_side_mode: str = "auto",
+    ):
         self.model = None
         self._lock = threading.Lock()
         self.device = "cuda"
         self.infer_imgsz = infer_imgsz
+        mode = (hand_side_mode or "auto").lower()
+        if mode not in ("auto", "normal", "swapped"):
+            mode = "auto"
+        self.hand_side_mode = mode
+        self._auto_swap_score = 0
+        self._swap_hands = mode == "swapped"
 
         if YOLO_AVAILABLE:
             try:
@@ -222,8 +233,8 @@ class HandRaiseDetector:
 
                 left_shoulder = points[self.LEFT_SHOULDER_IDX]
                 left_wrist = points[self.LEFT_WRIST_IDX]
-                shoulder = points[self.RIGHT_SHOULDER_IDX]
-                wrist = points[self.RIGHT_WRIST_IDX]
+                right_shoulder = points[self.RIGHT_SHOULDER_IDX]
+                right_wrist = points[self.RIGHT_WRIST_IDX]
 
                 if kpt_conf is not None:
                     right_valid = (
@@ -240,21 +251,45 @@ class HandRaiseDetector:
 
                 right_raised = False
                 left_raised = False
+                right_lift = float("-inf")
+                left_lift = float("-inf")
+                right_shoulder_y = 0.0
+                right_wrist_y = 0.0
+                left_shoulder_y = 0.0
+                left_wrist_y = 0.0
+                right_shoulder_x = float(right_shoulder[0])
+                left_shoulder_x = float(left_shoulder[0])
+
+                # auto 模式：根据肩膀左右顺序自动判断是否镜像画面
+                if self.hand_side_mode == "auto" and right_valid and left_valid:
+                    mirrored_sample = right_shoulder_x > left_shoulder_x
+                    if mirrored_sample:
+                        self._auto_swap_score = min(10, self._auto_swap_score + 1)
+                    else:
+                        self._auto_swap_score = max(-10, self._auto_swap_score - 1)
+                    if self._auto_swap_score >= 3:
+                        self._swap_hands = True
+                    elif self._auto_swap_score <= -3:
+                        self._swap_hands = False
+                elif self.hand_side_mode == "normal":
+                    self._swap_hands = False
 
                 if right_valid:
-                    shoulder_y = float(shoulder[1])
-                    wrist_y = float(wrist[1])
-                    right_raised = wrist_y < (shoulder_y - margin)
+                    right_shoulder_y = float(right_shoulder[1])
+                    right_wrist_y = float(right_wrist[1])
+                    right_lift = right_shoulder_y - right_wrist_y
+                    right_raised = right_lift > margin
 
                 if left_valid:
                     left_shoulder_y = float(left_shoulder[1])
                     left_wrist_y = float(left_wrist[1])
-                    left_raised = left_wrist_y < (left_shoulder_y - margin)
+                    left_lift = left_shoulder_y - left_wrist_y
+                    left_raised = left_lift > margin
 
                 # 调试信息：返回详细的关节点状态
                 debug_parts = []
                 if right_valid:
-                    debug_parts.append(f"RS={shoulder_y:.1f},RW={wrist_y:.1f}")
+                    debug_parts.append(f"RS={right_shoulder_y:.1f},RW={right_wrist_y:.1f}")
                 else:
                     debug_parts.append("right_invalid")
                 if left_valid:
@@ -264,12 +299,25 @@ class HandRaiseDetector:
                 debug_parts.append(f"margin={margin:.1f}")
                 if kpt_conf is not None:
                     debug_parts.append(f"conf={float(kpt_conf[self.RIGHT_WRIST_IDX]):.2f}")
+                debug_parts.append(f"swap={int(self._swap_hands)}")
                 debug_info = ",".join(debug_parts)
 
+                if right_raised and left_raised:
+                    # 双手同时抬起时，按抬起幅度更大的一侧判定；幅度接近时视为歧义不触发
+                    if abs(right_lift - left_lift) < max(6.0, margin * 0.25):
+                        return False, f"both hands raised ambiguous ({debug_info})"
+                    if right_lift > left_lift:
+                        right_raised, left_raised = True, False
+                    else:
+                        right_raised, left_raised = False, True
+
+                right_label = "left" if self._swap_hands else "right"
+                left_label = "right" if self._swap_hands else "left"
+
                 if right_raised:
-                    return True, f"right hand raised ({debug_info})"
+                    return True, f"{right_label} hand raised ({debug_info})"
                 if left_raised:
-                    return True, f"left hand raised ({debug_info})"
+                    return True, f"{left_label} hand raised ({debug_info})"
 
                 return False, f"hands below threshold ({debug_info})"
             except Exception as e:

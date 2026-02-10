@@ -196,7 +196,7 @@ class HandRaiseDetector:
     def get_hand_raise_state(
         self,
         frame: np.ndarray,
-        conf_threshold: float = 0.35,
+        conf_threshold: float = 0.5,
     ) -> tuple[bool, str]:
         """检测画面主人物是否抬手（右手/左手任一）"""
         if self.model is None:
@@ -226,7 +226,7 @@ class HandRaiseDetector:
                 person_idx = int(box_areas.argmax().item())
                 person_box = boxes.xyxy[person_idx]
                 box_h = max(float(person_box[3] - person_box[1]), 1.0)
-                margin = max(10.0, box_h * 0.08)
+                margin = max(14.0, box_h * 0.12)
 
                 points = keypoints.xy[person_idx]
                 kpt_conf = keypoints.conf[person_idx] if keypoints.conf is not None else None
@@ -298,7 +298,10 @@ class HandRaiseDetector:
                     debug_parts.append("left_invalid")
                 debug_parts.append(f"margin={margin:.1f}")
                 if kpt_conf is not None:
-                    debug_parts.append(f"conf={float(kpt_conf[self.RIGHT_WRIST_IDX]):.2f}")
+                    debug_parts.append(
+                        f"rconf={float(kpt_conf[self.RIGHT_WRIST_IDX]):.2f},"
+                        f"lconf={float(kpt_conf[self.LEFT_WRIST_IDX]):.2f}"
+                    )
                 debug_parts.append(f"swap={int(self._swap_hands)}")
                 debug_info = ",".join(debug_parts)
 

@@ -412,7 +412,7 @@ def track_human_realtime(num_steps: int = DEFAULT_NUM_STEPS,
     gesture_handler = (
         HandGestureHandler(
             detector=hand_detector,
-            confirm_frames=1 if quick_mode else 2,
+            confirm_frames=2 if quick_mode else 3,
             release_frames=2 if quick_mode else 3,
             cooldown_sec=0.6 if quick_mode else 1.0,
             log_interval_sec=0.5 if quick_mode else 1.0,

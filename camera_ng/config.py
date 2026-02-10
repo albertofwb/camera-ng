@@ -90,8 +90,8 @@ YOLO_CONFIDENCE = get_config('detection.confidence_threshold', 0.5)
 
 # 云台配置
 ROTATION_SPEED = get_config('camera.ptz.rotation_speed', 28)
-PTZ_SPEED = get_config('camera.ptz.speed', 1)
-PTZ_FAST_SPEED = get_config('camera.ptz.speed_fast', 3)
+PTZ_SPEED = get_config('camera.ptz.speed', 2)
+PTZ_FAST_SPEED = get_config('camera.ptz.speed_fast', 4)
 LEFT_LIMIT_STEP_DURATION = get_config('camera.ptz.left_limit_step_duration', 0.5)
 TURN_STABILIZE_TIME = get_config('camera.ptz.turn_stabilize_time', 0.5)
 
